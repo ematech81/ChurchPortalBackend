@@ -1,5 +1,6 @@
 import {
   Injectable,
+  Logger,
   UnauthorizedException,
   ConflictException,
   BadRequestException,
@@ -21,6 +22,8 @@ import { VerifyOtpDto } from './dto/verify-otp.dto';
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+
   constructor(
     private readonly usersService: UsersService,
     private readonly mailService: MailService,
@@ -30,12 +33,25 @@ export class AuthService {
 
   async register(dto: RegisterDto) {
     const existing = await this.usersService.findByEmail(dto.email);
-    if (existing) throw new ConflictException('Email already registered');
+
+    if (existing) {
+      // Already verified → hard conflict
+      if (existing.isEmailVerified) {
+        throw new ConflictException('An account with this email already exists. Please log in.');
+      }
+      // Exists but unverified → resend OTP silently so they can continue
+      await this._safeDispatchOtp(existing.id, existing.email);
+      return {
+        message: 'A verification code has been sent to your email.',
+        email: existing.email,
+        userId: existing.id,
+      };
+    }
 
     const passwordHash = await bcrypt.hash(dto.password, 12);
     const user = await this.usersService.create({ ...dto, passwordHash });
 
-    await this._dispatchOtp(user.id, user.email);
+    await this._safeDispatchOtp(user.id, user.email);
 
     return {
       message: 'A 6-digit verification code has been sent to your email.',
@@ -87,8 +103,7 @@ export class AuthService {
     if (!valid) throw new UnauthorizedException('Invalid credentials');
 
     if (!user.isEmailVerified) {
-      // Auto-resend OTP so they can verify immediately
-      await this._dispatchOtp(user.id, user.email);
+      await this._safeDispatchOtp(user.id, user.email);
       throw new ForbiddenException({
         message: 'Please verify your email first. A new code has been sent.',
         code: 'EMAIL_NOT_VERIFIED',
@@ -352,5 +367,14 @@ export class AuthService {
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
     await this.usersService.setOtp(userId, code, expiresAt);
     await this.mailService.sendOtp(email, code);
+  }
+
+  // Like _dispatchOtp but never throws — email failure won't crash the request
+  private async _safeDispatchOtp(userId: string, email: string) {
+    try {
+      await this._dispatchOtp(userId, email);
+    } catch (err: any) {
+      this.logger.error(`OTP email failed for ${email}: ${err?.message ?? err}`);
+    }
   }
 }
