@@ -7,11 +7,13 @@ import { AuthService } from './auth.service';
 import { JwtStrategy } from './strategies/jwt.strategy';
 import { UsersModule } from '../users/users.module';
 import { MailModule } from '../mail/mail.module';
+import { MessagingModule } from '../messaging/messaging.module';
 
 @Module({
   imports: [
     UsersModule,
     MailModule,
+    MessagingModule, // TermiiProvider, for pastor login codes by SMS
     PassportModule,
     JwtModule.registerAsync({
       inject: [ConfigService],

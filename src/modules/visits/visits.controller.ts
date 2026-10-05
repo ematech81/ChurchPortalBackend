@@ -1,22 +1,23 @@
-import { Controller, Get, Post, Patch, Param, Body, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Param, Body, ParseUUIDPipe } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { VisitsService } from './visits.service';
-import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { CreateVisitDto, UpdateVisitDto } from './dto/visit.dto';
 import { ChurchId } from '../../common/decorators/church-id.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { Roles } from '../../common/decorators/roles.decorator';
+import { UserRole } from '@/types';
+import { ADMIN_ROLES } from '../../constants/role-groups';
 
+// Visits belong to the follow-up worker who owns them (pastors can manage all).
 @ApiTags('Visits')
 @ApiBearerAuth()
-@UseGuards(JwtAuthGuard)
+@Roles(...ADMIN_ROLES, UserRole.FOLLOW_UP_WORKER, UserRole.CELL_LEADER)
 @Controller('visits')
 export class VisitsController {
   constructor(private readonly visitsService: VisitsService) {}
 
   @Get('mine')
-  getMyVisits(
-    @CurrentUser() user: { id: string },
-    @ChurchId() churchId: string,
-  ) {
+  getMyVisits(@CurrentUser() user: { id: string }, @ChurchId() churchId: string) {
     return this.visitsService.getUpcoming(user.id, churchId);
   }
 
@@ -24,17 +25,19 @@ export class VisitsController {
   create(
     @CurrentUser() user: { id: string },
     @ChurchId() churchId: string,
-    @Body() body: any,
+    @Body() dto: CreateVisitDto,
   ) {
-    return this.visitsService.create(churchId, user.id, body);
+    return this.visitsService.create(churchId, user.id, dto);
   }
 
   @Patch(':id')
   update(
-    @Param('id') id: string,
+    @Param('id', ParseUUIDPipe) id: string,
     @ChurchId() churchId: string,
-    @Body() body: any,
+    @CurrentUser() user: { id: string; role: UserRole },
+    @Body() dto: UpdateVisitDto,
   ) {
-    return this.visitsService.update(id, churchId, body);
+    const isAdmin = (ADMIN_ROLES as string[]).includes(user.role);
+    return this.visitsService.update(id, churchId, dto, isAdmin ? null : user.id);
   }
 }

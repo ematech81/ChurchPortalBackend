@@ -6,89 +6,118 @@ import {
   BadRequestException,
   ForbiddenException,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
-import { CreatePinDto } from './dto/create-pin.dto';
-import { ResetPinDto } from './dto/reset-pin.dto';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcryptjs';
+import { createHash, createHmac, randomInt, randomUUID, timingSafeEqual } from 'crypto';
 import { UsersService } from '../users/users.service';
 import { MailService } from '../mail/mail.service';
+import { TermiiProvider } from '../messaging/providers/termii.provider';
 import { User } from '../users/user.entity';
 import { UserRole } from '@/types';
+import { toE164 } from '../../common/utils/phone';
+import { BCRYPT_ROUNDS } from '../../common/utils/hash';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { VerifyOtpDto } from './dto/verify-otp.dto';
+import { CreatePinDto } from './dto/create-pin.dto';
+import { ResetPinDto } from './dto/reset-pin.dto';
+import { VerifyPhoneOtpDto } from './dto/phone.dto';
+
+const OTP_TTL_MS = 10 * 60 * 1000;
+const OTP_RESEND_COOLDOWN_MS = 60 * 1000;
+const MAX_OTP_ATTEMPTS = 5;
+
+/** Emails we generate for accounts that have no real mailbox. Never deliver to these. */
+const isPlaceholderEmail = (e?: string | null) => !e || e.endsWith('@portal.internal');
+
+const sha256Hex = (v: string) => createHash('sha256').update(v).digest('hex');
+
+function safeEqualHex(a: string, b: string): boolean {
+  const ab = Buffer.from(a, 'hex');
+  const bb = Buffer.from(b, 'hex');
+  return ab.length === bb.length && ab.length > 0 && timingSafeEqual(ab, bb);
+}
 
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
+  // Compared against when the email doesn't exist, so response time doesn't reveal it.
+  private dummyHash: string | null = null;
 
   constructor(
     private readonly usersService: UsersService,
     private readonly mailService: MailService,
+    private readonly sms: TermiiProvider,
     private readonly jwtService: JwtService,
     private readonly config: ConfigService,
   ) {}
+
+  // ── Email + password ────────────────────────────────────────────────────────
 
   async register(dto: RegisterDto) {
     const existing = await this.usersService.findByEmail(dto.email);
 
     if (existing) {
-      // Already verified → hard conflict
       if (existing.isEmailVerified) {
         throw new ConflictException('An account with this email already exists. Please log in.');
       }
-      // Exists but unverified → resend OTP silently so they can continue
-      await this._safeDispatchOtp(existing.id, existing.email);
+      // Unverified: the latest registrant's password wins. Otherwise someone could
+      // pre-register a victim's email with a password only they know.
+      const passwordHash = await bcrypt.hash(dto.password, BCRYPT_ROUNDS);
+      await this.usersService.update(existing.id, {
+        passwordHash,
+        firstName: dto.firstName,
+        lastName: dto.lastName,
+        phone: dto.phone ?? existing.phone,
+      });
+      const emailSent = await this._safeDispatchOtp(existing.id, existing.email);
       return {
         message: 'A verification code has been sent to your email.',
         email: existing.email,
         userId: existing.id,
+        emailSent,
       };
     }
 
-    const passwordHash = await bcrypt.hash(dto.password, 12);
-    const user = await this.usersService.create({ ...dto, passwordHash });
+    const passwordHash = await bcrypt.hash(dto.password, BCRYPT_ROUNDS);
+    const user = await this.usersService.create({
+      firstName: dto.firstName,
+      lastName: dto.lastName,
+      email: dto.email,
+      phone: dto.phone ?? null,
+      passwordHash,
+    });
 
-    await this._safeDispatchOtp(user.id, user.email);
+    const emailSent = await this._safeDispatchOtp(user.id, user.email);
 
     return {
       message: 'A 6-digit verification code has been sent to your email.',
       email: user.email,
       userId: user.id,
+      emailSent,
     };
   }
 
   async resendOtp(email: string) {
+    const generic = { message: 'If that account needs verification, a new code has been sent.' };
     const user = await this.usersService.findByEmail(email);
-    if (!user) throw new NotFoundException('No account found with that email');
-    if (user.isEmailVerified) throw new BadRequestException('Email is already verified');
+    // Same answer whether or not the account exists (no account enumeration).
+    if (!user || user.isEmailVerified) return generic;
 
-    // Rate-limit: 1 resend per 60 seconds
-    if (user.otpExpiresAt && user.otpExpiresAt.getTime() - Date.now() > 9 * 60 * 1000) {
-      throw new BadRequestException('Please wait 60 seconds before requesting a new code');
-    }
-
-    await this._dispatchOtp(user.id, email);
-    return { message: 'A new verification code has been sent to your email.' };
+    this._assertResendAllowed(user);
+    await this._dispatchOtp(user.id, user.email);
+    return generic;
   }
 
   async verifyOtp(dto: VerifyOtpDto) {
     const user = await this.usersService.findByEmail(dto.email);
-    if (!user) throw new UnauthorizedException('Invalid verification attempt');
+    // Only unverified accounts can use this endpoint; verified ones sign in with a password.
+    if (!user || user.isEmailVerified) throw new UnauthorizedException('Invalid verification attempt');
 
-    if (!user.otpCode || !user.otpExpiresAt) {
-      throw new BadRequestException('No pending verification. Please request a new code.');
-    }
-
-    if (Date.now() > user.otpExpiresAt.getTime()) {
-      throw new BadRequestException('Verification code has expired. Please request a new one.');
-    }
-
-    if (user.otpCode !== dto.code) {
-      throw new UnauthorizedException('Invalid verification code. Please try again.');
-    }
+    await this._checkOtp(user, dto.code);
 
     await this.usersService.setEmailVerified(user.id);
     const fresh = await this.usersService.findById(user.id);
@@ -97,10 +126,14 @@ export class AuthService {
 
   async login(dto: LoginDto) {
     const user = await this.usersService.findByEmail(dto.email);
-    if (!user) throw new UnauthorizedException('Invalid credentials');
+    if (!user) {
+      await bcrypt.compare(dto.password, await this._getDummyHash());
+      throw new UnauthorizedException('Invalid credentials');
+    }
 
     const valid = await bcrypt.compare(dto.password, user.passwordHash);
     if (!valid) throw new UnauthorizedException('Invalid credentials');
+    if (!user.isActive) throw new ForbiddenException('This account has been deactivated.');
 
     if (!user.isEmailVerified) {
       await this._safeDispatchOtp(user.id, user.email);
@@ -114,13 +147,31 @@ export class AuthService {
     return this.issueTokens(user);
   }
 
-  async refreshTokens(userId: string, refreshToken: string) {
-    const user = await this.usersService.findById(userId);
-    if (!user || !user.refreshTokenHash)
-      throw new UnauthorizedException('Access denied');
+  // ── Tokens ──────────────────────────────────────────────────────────────────
 
-    const valid = await bcrypt.compare(refreshToken, user.refreshTokenHash);
-    if (!valid) throw new UnauthorizedException('Access denied');
+  /**
+   * The refresh token is self-describing: we verify its signature, read the user
+   * from it, and compare its SHA-256 to the stored hash. (bcrypt is unsuitable
+   * here — it only hashes the first 72 bytes, and a JWT's first 72 chars are the
+   * same for every token of a given user.)
+   */
+  async refreshTokens(refreshToken: string) {
+    let payload: { sub?: string; typ?: string };
+    try {
+      payload = this.jwtService.verify(refreshToken, {
+        secret: this.config.get('app.jwtRefreshSecret'),
+      });
+    } catch {
+      throw new UnauthorizedException('Access denied');
+    }
+    if (payload.typ !== 'refresh' || !payload.sub) throw new UnauthorizedException('Access denied');
+
+    const user = await this.usersService.findById(payload.sub);
+    if (!user || !user.isActive || !user.refreshTokenHash) throw new UnauthorizedException('Access denied');
+
+    if (!safeEqualHex(sha256Hex(refreshToken), user.refreshTokenHash)) {
+      throw new UnauthorizedException('Access denied');
+    }
 
     return this.issueTokens(user);
   }
@@ -129,18 +180,22 @@ export class AuthService {
     await this.usersService.clearRefreshToken(userId);
   }
 
-  // Called by ChurchesService after church creation to re-issue tokens with updated churchId
+  // Also called by ChurchesService after church creation to re-issue tokens with updated churchId
   async issueTokens(user: User) {
-    const payload = { sub: user.id, churchId: user.churchId, role: user.role };
-
-    const accessToken = this.jwtService.sign(payload);
-    const refreshToken = this.jwtService.sign(payload, {
-      secret: this.config.get('app.jwtRefreshSecret'),
-      expiresIn: this.config.get('app.jwtRefreshExpiresIn', '30d'),
+    const accessToken = this.jwtService.sign({
+      sub: user.id,
+      churchId: user.churchId,
+      role: user.role,
     });
+    const refreshToken = this.jwtService.sign(
+      { sub: user.id, typ: 'refresh', jti: randomUUID() },
+      {
+        secret: this.config.get('app.jwtRefreshSecret'),
+        expiresIn: this.config.get('app.jwtRefreshExpiresIn', '30d'),
+      },
+    );
 
-    const refreshTokenHash = await bcrypt.hash(refreshToken, 12);
-    await this.usersService.setRefreshToken(user.id, refreshTokenHash);
+    await this.usersService.setRefreshToken(user.id, sha256Hex(refreshToken));
 
     return {
       accessToken,
@@ -158,70 +213,37 @@ export class AuthService {
     };
   }
 
-  // ── Branch Pastor phone-OTP login ────────────────────────────────────────────
+  // ── Branch Pastor phone-OTP login ───────────────────────────────────────────
 
   async loginWithPhone(phone: string) {
-    const user = await this.usersService.findByPhone(phone);
-    if (!user) {
-      throw new NotFoundException({
-        message: 'Access Denied!',
-        detail:
-          'Either you entered an incorrect phone number or you have not yet been assigned a Branch Pastor role. Kindly contact your Senior Pastor for assistance.',
-        code: 'PHONE_NOT_FOUND',
-      });
-    }
-    if (user.role !== UserRole.BRANCH_PASTOR) {
-      throw new ForbiddenException({
-        message: 'Access Denied!',
-        detail:
-          'This login is for Branch Pastors only. Please use the Admin login with your email address.',
-        code: 'WRONG_LOGIN_TYPE',
-      });
-    }
-    if (!user.churchId) {
-      throw new ForbiddenException({
-        message: 'Access Denied!',
-        detail:
-          'Your account has not yet been assigned to a branch. Kindly contact your Senior Pastor for assistance.',
-        code: 'NO_BRANCH_ASSIGNED',
-      });
-    }
-    const devCode = await this._dispatchPhoneOtp(user.id, phone);
+    const user = await this._findBranchPastor(phone, true);
+    const { delivery, devCode } = await this._sendPastorOtp(user, phone);
     return {
-      message: 'A 6-digit verification code has been sent to your phone.',
+      message:
+        delivery === 'email'
+          ? 'A 6-digit verification code has been sent to your email address on file.'
+          : 'A 6-digit verification code has been sent to your phone.',
       phone,
-      // devCode is only included outside production — never logged or returned in prod
-      ...(process.env.NODE_ENV !== 'production' && { devCode }),
+      delivery,
+      ...(devCode && { devCode }),
     };
   }
 
   async resendPhoneOtp(phone: string) {
-    const user = await this.usersService.findByPhone(phone);
-    if (!user) throw new NotFoundException('No account found with this phone number.');
-    // Rate-limit: same 60-second window as email OTP
-    if (user.otpExpiresAt && user.otpExpiresAt.getTime() - Date.now() > 9 * 60 * 1000) {
-      throw new BadRequestException('Please wait 60 seconds before requesting a new code.');
-    }
-    const devCode = await this._dispatchPhoneOtp(user.id, phone);
-    return {
-      message: 'A new verification code has been sent.',
-      ...(process.env.NODE_ENV !== 'production' && { devCode }),
-    };
+    const user = await this._findBranchPastor(phone, false);
+    this._assertResendAllowed(user);
+    const { delivery, devCode } = await this._sendPastorOtp(user, phone);
+    return { message: 'A new verification code has been sent.', delivery, ...(devCode && { devCode }) };
   }
 
-  async verifyPhoneOtp(dto: { phone: string; code: string }) {
+  async verifyPhoneOtp(dto: VerifyPhoneOtpDto) {
     const user = await this.usersService.findByPhone(dto.phone);
-    if (!user) throw new UnauthorizedException('Invalid verification attempt.');
+    // One generic answer for unknown phone / wrong role / no church.
+    if (!user || user.role !== UserRole.BRANCH_PASTOR || !user.churchId || !user.isActive) {
+      throw new UnauthorizedException('Invalid verification attempt.');
+    }
 
-    if (!user.otpCode || !user.otpExpiresAt) {
-      throw new BadRequestException('No pending verification. Please request a new code.');
-    }
-    if (Date.now() > user.otpExpiresAt.getTime()) {
-      throw new BadRequestException('Verification code has expired. Please request a new one.');
-    }
-    if (user.otpCode !== dto.code) {
-      throw new UnauthorizedException('Invalid verification code. Please try again.');
-    }
+    await this._checkOtp(user, dto.code);
 
     await this.usersService.clearOtp(user.id);
     const fresh = await this.usersService.findById(user.id);
@@ -235,11 +257,11 @@ export class AuthService {
     if (!user) throw new UnauthorizedException();
     this._assertPastorRole(user.role);
 
+    if (user.hasPin) {
+      throw new BadRequestException('A PIN is already set. Use "Forgot PIN" to change it.');
+    }
     if (dto.pin !== dto.confirmPin) {
       throw new BadRequestException('PINs do not match.');
-    }
-    if (!/^\d{4}$/.test(dto.pin)) {
-      throw new BadRequestException('PIN must be exactly 4 digits.');
     }
 
     const pinHash = await bcrypt.hash(dto.pin, 10);
@@ -292,24 +314,13 @@ export class AuthService {
     if (dto.newPin !== dto.confirmPin) {
       throw new BadRequestException('PINs do not match.');
     }
-    if (!/^\d{4}$/.test(dto.newPin)) {
-      throw new BadRequestException('PIN must be exactly 4 digits.');
-    }
 
-    if (user.role === 'senior_pastor') {
+    if (user.role === UserRole.SENIOR_PASTOR) {
       const valid = await bcrypt.compare(dto.credential, user.passwordHash);
       if (!valid) throw new UnauthorizedException('Incorrect password.');
     } else {
-      // Branch Pastor: credential is OTP code
-      if (!user.otpCode || !user.otpExpiresAt) {
-        throw new BadRequestException('No pending OTP. Please request a new code.');
-      }
-      if (Date.now() > user.otpExpiresAt.getTime()) {
-        throw new BadRequestException('OTP has expired. Please request a new one.');
-      }
-      if (user.otpCode !== dto.credential) {
-        throw new UnauthorizedException('Invalid OTP code.');
-      }
+      // Branch Pastor: credential is the OTP they requested via resend-pastor-otp
+      await this._checkOtp(user, dto.credential);
       await this.usersService.clearOtp(userId);
     }
 
@@ -318,18 +329,19 @@ export class AuthService {
     return { success: true, hasPin: true };
   }
 
-  // ── Worker code login ────────────────────────────────────────────────────────
+  // ── Worker code login ───────────────────────────────────────────────────────
 
   async loginWithWorkerCode(code: string) {
-    const hash = UsersService.hashLoginCode(code);
-    const user = await this.usersService.findByLoginCodeHash(hash);
+    const invalid = new UnauthorizedException({
+      message: 'Invalid worker code.',
+      detail: 'Check the code your pastor gave you and try again.',
+      code: 'INVALID_WORKER_CODE',
+    });
 
-    if (!user) {
-      throw new UnauthorizedException({
-        message: 'Invalid worker code.',
-        detail: 'Check the code your pastor gave you and try again.',
-        code: 'INVALID_WORKER_CODE',
-      });
+    const user = await this.usersService.findByLoginCodeHash(UsersService.hashLoginCode(code));
+    // A worker code must only ever open a worker account — never a pastor/admin one.
+    if (!user || user.role !== UserRole.FOLLOW_UP_WORKER || !user.isActive || !user.churchId) {
+      throw invalid;
     }
 
     if (user.loginCodeLockedUntil && user.loginCodeLockedUntil > new Date()) {
@@ -347,34 +359,139 @@ export class AuthService {
     return this.issueTokens(fresh!);
   }
 
+  // ── Internals ───────────────────────────────────────────────────────────────
+
   private _assertPastorRole(role: string) {
-    if (role !== 'senior_pastor' && role !== 'branch_pastor') {
+    if (role !== UserRole.SENIOR_PASTOR && role !== UserRole.BRANCH_PASTOR) {
       throw new ForbiddenException('PIN management is for pastors only.');
     }
   }
 
-  private async _dispatchPhoneOtp(userId: string, phone: string): Promise<string> {
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-    await this.usersService.setOtp(userId, code, expiresAt);
-    // TODO: replace with Termii SMS in production
-    console.log(`[DEV] Branch Pastor OTP for ${phone}: ${code}`);
-    return code;
+  private async _getDummyHash() {
+    if (!this.dummyHash) this.dummyHash = await bcrypt.hash('not-a-real-password', BCRYPT_ROUNDS);
+    return this.dummyHash;
+  }
+
+  private _otpHash(code: string) {
+    return createHmac('sha256', this.config.get<string>('app.jwtSecret')!).update(code).digest('hex');
+  }
+
+  private _newOtp() {
+    return randomInt(100000, 1000000).toString(); // CSPRNG, uniform 6 digits
+  }
+
+  private _assertResendAllowed(user: User) {
+    // The OTP is issued with a 10-minute lifetime; >9 minutes left means it was sent <60s ago.
+    if (user.otpExpiresAt && user.otpExpiresAt.getTime() - Date.now() > OTP_TTL_MS - OTP_RESEND_COOLDOWN_MS) {
+      throw new BadRequestException('Please wait 60 seconds before requesting a new code.');
+    }
+  }
+
+  /** Validates an OTP, counting wrong guesses and destroying the code at the limit. */
+  private async _checkOtp(user: User, code: string) {
+    if (!user.otpCode || !user.otpExpiresAt) {
+      throw new BadRequestException('No pending verification. Please request a new code.');
+    }
+    if (Date.now() > user.otpExpiresAt.getTime()) {
+      throw new BadRequestException('Verification code has expired. Please request a new one.');
+    }
+    if (!safeEqualHex(this._otpHash(code), user.otpCode)) {
+      const attempts = await this.usersService.incrementOtpAttempts(user.id);
+      if (attempts >= MAX_OTP_ATTEMPTS) {
+        await this.usersService.clearOtp(user.id);
+        throw new BadRequestException({
+          code: 'OTP_LOCKED',
+          message: 'Too many incorrect attempts. Please request a new code.',
+        });
+      }
+      throw new UnauthorizedException('Invalid verification code. Please try again.');
+    }
+  }
+
+  private async _findBranchPastor(phone: string, detailed: boolean): Promise<User> {
+    const user = await this.usersService.findByPhone(phone);
+    if (!user) {
+      throw new NotFoundException({
+        message: 'Access Denied!',
+        detail:
+          'Either you entered an incorrect phone number or you have not yet been assigned a Branch Pastor role. Kindly contact your Senior Pastor for assistance.',
+        code: 'PHONE_NOT_FOUND',
+      });
+    }
+    if (user.role !== UserRole.BRANCH_PASTOR) {
+      throw new ForbiddenException({
+        message: 'Access Denied!',
+        detail: detailed
+          ? 'This login is for Branch Pastors only. Please use the Admin login with your email address.'
+          : 'This login is for Branch Pastors only.',
+        code: 'WRONG_LOGIN_TYPE',
+      });
+    }
+    if (!user.churchId) {
+      throw new ForbiddenException({
+        message: 'Access Denied!',
+        detail:
+          'Your account has not yet been assigned to a branch. Kindly contact your Senior Pastor for assistance.',
+        code: 'NO_BRANCH_ASSIGNED',
+      });
+    }
+    if (!user.isActive) throw new ForbiddenException('This account has been deactivated.');
+    return user;
+  }
+
+  /**
+   * Delivers a pastor login code: SMS (Termii) if configured, else the email on
+   * file, else — local development only — returned in the response.
+   * In production with no channel configured we refuse rather than pretend.
+   */
+  private async _sendPastorOtp(
+    user: User,
+    phone: string,
+  ): Promise<{ delivery: 'sms' | 'email' | 'dev'; devCode?: string }> {
+    const code = this._newOtp();
+    await this.usersService.setOtp(user.id, this._otpHash(code), new Date(Date.now() + OTP_TTL_MS));
+
+    try {
+      if (this.sms.isConfigured) {
+        await this.sms.sendSms(
+          toE164(phone),
+          `Your Kingdom Portal code is ${code}. It expires in 10 minutes. Never share it.`,
+        );
+        return { delivery: 'sms' };
+      }
+      if (!isPlaceholderEmail(user.email) && this.config.get('app.brevoApiKey')) {
+        await this.mailService.sendOtp(user.email, code);
+        return { delivery: 'email' };
+      }
+      if (this.config.get<boolean>('app.allowDevOtp')) {
+        this.logger.warn(`[DEV] Branch Pastor OTP for ${phone}: ${code}`);
+        return { delivery: 'dev', devCode: code };
+      }
+    } catch (err: any) {
+      await this.usersService.clearOtp(user.id);
+      this.logger.error(`Pastor OTP delivery failed for user ${user.id}: ${err?.message ?? err}`);
+      throw new ServiceUnavailableException('We could not send your code right now. Please try again shortly.');
+    }
+
+    await this.usersService.clearOtp(user.id);
+    this.logger.error('Pastor OTP requested but neither SMS (TERMII_*) nor email (BREVO_API_KEY) is configured.');
+    throw new ServiceUnavailableException('Code delivery is not available. Please contact support.');
   }
 
   private async _dispatchOtp(userId: string, email: string) {
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
-    await this.usersService.setOtp(userId, code, expiresAt);
+    const code = this._newOtp();
+    await this.usersService.setOtp(userId, this._otpHash(code), new Date(Date.now() + OTP_TTL_MS));
     await this.mailService.sendOtp(email, code);
   }
 
-  // Like _dispatchOtp but never throws — email failure won't crash the request
-  private async _safeDispatchOtp(userId: string, email: string) {
+  /** Like _dispatchOtp but never throws; returns whether the email went out. */
+  private async _safeDispatchOtp(userId: string, email: string): Promise<boolean> {
     try {
       await this._dispatchOtp(userId, email);
+      return true;
     } catch (err: any) {
       this.logger.error(`OTP email failed for ${email}: ${err?.message ?? err}`);
+      return false;
     }
   }
 }

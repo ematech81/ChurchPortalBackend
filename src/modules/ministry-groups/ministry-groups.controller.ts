@@ -1,17 +1,19 @@
 import {
   Controller, Get, Post, Patch, Delete,
-  Param, Body, Query, UseGuards, HttpCode, HttpStatus,
+  Param, Body, Query, ParseUUIDPipe, HttpCode, HttpStatus,
 } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { MinistryGroupsService } from './ministry-groups.service';
-import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import {
+  CreateCategoryDto, CreateGroupDto, UpdateGroupDto, AddGroupMemberDto, RecordGroupAttendanceDto,
+} from './dto/ministry-group.dto';
 import { ChurchId } from '../../common/decorators/church-id.decorator';
-import { CurrentUser } from '../../common/decorators/current-user.decorator';
-import { GroupStatus } from './ministry-group.entity';
+import { Roles } from '../../common/decorators/roles.decorator';
+import { ADMIN_ROLES, STAFF_ROLES } from '../../constants/role-groups';
 
 @ApiTags('Ministry Groups')
 @ApiBearerAuth()
-@UseGuards(JwtAuthGuard)
+@Roles(...ADMIN_ROLES)
 @Controller()
 export class MinistryGroupsController {
   constructor(private readonly svc: MinistryGroupsService) {}
@@ -19,18 +21,20 @@ export class MinistryGroupsController {
   // ── Categories ─────────────────────────────────────────────────────────────
 
   @Get('group-categories')
+  @Roles(...STAFF_ROLES)
   listCategories(@ChurchId() churchId: string) {
     return this.svc.listCategories(churchId);
   }
 
   @Post('group-categories')
-  createCategory(@ChurchId() churchId: string, @Body() body: any) {
-    return this.svc.createCategory(churchId, body);
+  createCategory(@ChurchId() churchId: string, @Body() dto: CreateCategoryDto) {
+    return this.svc.createCategory(churchId, dto);
   }
 
   // ── Groups ─────────────────────────────────────────────────────────────────
 
   @Get('ministry-groups')
+  @Roles(...STAFF_ROLES)
   listGrouped(
     @ChurchId() churchId: string,
     @Query('search') search?: string,
@@ -47,29 +51,30 @@ export class MinistryGroupsController {
   @Post('ministry-groups')
   createGroup(
     @ChurchId() churchId: string,
-    @Body() body: any,
+    @Body() dto: CreateGroupDto,
     @Query('draft') draft?: string,
   ) {
-    return this.svc.createGroup(churchId, { ...body, isDraft: draft === 'true' });
+    return this.svc.createGroup(churchId, { ...dto, isDraft: draft === 'true' });
   }
 
   @Get('ministry-groups/:id')
-  getGroup(@Param('id') id: string, @ChurchId() churchId: string) {
+  @Roles(...STAFF_ROLES)
+  getGroup(@Param('id', ParseUUIDPipe) id: string, @ChurchId() churchId: string) {
     return this.svc.getGroupById(id, churchId);
   }
 
   @Patch('ministry-groups/:id')
   updateGroup(
-    @Param('id') id: string,
+    @Param('id', ParseUUIDPipe) id: string,
     @ChurchId() churchId: string,
-    @Body() body: any,
+    @Body() dto: UpdateGroupDto,
   ) {
-    return this.svc.updateGroup(id, churchId, body);
+    return this.svc.updateGroup(id, churchId, dto);
   }
 
   @Delete('ministry-groups/:id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  deleteGroup(@Param('id') id: string, @ChurchId() churchId: string) {
+  deleteGroup(@Param('id', ParseUUIDPipe) id: string, @ChurchId() churchId: string) {
     return this.svc.deleteGroup(id, churchId);
   }
 
@@ -77,18 +82,18 @@ export class MinistryGroupsController {
 
   @Post('ministry-groups/:id/members')
   addMember(
-    @Param('id') groupId: string,
+    @Param('id', ParseUUIDPipe) groupId: string,
     @ChurchId() churchId: string,
-    @Body() body: { memberId: string; roleTitle?: string },
+    @Body() dto: AddGroupMemberDto,
   ) {
-    return this.svc.addMember(groupId, churchId, body.memberId, body.roleTitle);
+    return this.svc.addMember(groupId, churchId, dto.memberId, dto.roleTitle);
   }
 
   @Delete('ministry-groups/:id/members/:memberId')
   @HttpCode(HttpStatus.NO_CONTENT)
   removeMember(
-    @Param('id') groupId: string,
-    @Param('memberId') memberId: string,
+    @Param('id', ParseUUIDPipe) groupId: string,
+    @Param('memberId', ParseUUIDPipe) memberId: string,
     @ChurchId() churchId: string,
   ) {
     return this.svc.removeMember(groupId, memberId, churchId);
@@ -98,10 +103,10 @@ export class MinistryGroupsController {
 
   @Post('ministry-groups/:id/attendance')
   recordAttendance(
-    @Param('id') groupId: string,
+    @Param('id', ParseUUIDPipe) groupId: string,
     @ChurchId() churchId: string,
-    @Body() body: { date: string; presentCount: number; totalCount: number },
+    @Body() dto: RecordGroupAttendanceDto,
   ) {
-    return this.svc.recordAttendance(groupId, churchId, body.date, body.presentCount, body.totalCount);
+    return this.svc.recordAttendance(groupId, churchId, dto.date, dto.presentCount, dto.totalCount);
   }
 }

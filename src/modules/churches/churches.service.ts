@@ -1,14 +1,28 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import * as bcrypt from 'bcryptjs';
-import { Repository } from 'typeorm';
+import { randomBytes } from 'crypto';
+import { In, Repository } from 'typeorm';
 import { Church } from './church.entity';
 import { Member } from '../members/member.entity';
 import { User } from '../users/user.entity';
 import { UsersService } from '../users/users.service';
 import { AuthService } from '../auth/auth.service';
-import { UserRole } from '@/types';
+import { UserRole, MemberStatus, ChurchRole } from '@/types';
 import { CreateChurchDto } from './dto/create-church.dto';
+import { UpdateChurchDto, CreateBranchDto, UpdateBranchDto } from './dto/church.dto';
+import { phoneDigitVariants } from '../../common/utils/phone';
+import { BCRYPT_ROUNDS } from '../../common/utils/hash';
+
+/** Existing accounts that must never be converted into a branch pastor by phone match. */
+const PROTECTED_ROLES: string[] = [UserRole.SUPER_ADMIN, UserRole.SENIOR_PASTOR, UserRole.ADMIN_PASTOR];
 
 @Injectable()
 export class ChurchesService {
@@ -34,35 +48,63 @@ export class ChurchesService {
     return this.repo.save(this.repo.create(data));
   }
 
-  async update(id: string, data: Partial<Church>) {
-    await this.repo.update(id, data as any);
+  async update(id: string, data: UpdateChurchDto) {
+    if (Object.keys(data).length) await this.repo.update(id, data as any);
     return this.findByIdOrFail(id);
   }
 
+  /**
+   * Onboarding step 1. Idempotent: if the caller already heads a church, this
+   * updates it instead of creating a duplicate (the mobile flow can be retried).
+   * The caller's role is derived here from server state, never from the request.
+   */
   async createForUser(userId: string, dto: CreateChurchDto) {
-    const slug = this._slugify(dto.name);
-    const role = dto.parentChurchId ? UserRole.BRANCH_PASTOR : UserRole.SENIOR_PASTOR;
+    const user = await this.usersService.findById(userId);
+    if (!user) throw new UnauthorizedException();
+
+    if (user.churchId) {
+      if (user.role !== UserRole.SENIOR_PASTOR && user.role !== UserRole.SUPER_ADMIN) {
+        throw new ForbiddenException('Your account already belongs to a church.');
+      }
+      const church = await this.update(user.churchId, {
+        name: dto.name,
+        denomination: dto.denomination,
+        address: dto.address,
+        phone: dto.phone,
+        email: dto.email,
+        logoUrl: dto.logoUrl,
+      });
+      return { church, ...(await this.authService.issueTokens(user)) };
+    }
+
+    if (user.role !== UserRole.MEMBER && user.role !== UserRole.SUPER_ADMIN) {
+      throw new ForbiddenException('This account cannot create a church.');
+    }
 
     const church = await this.create({
-      name: dto.name, slug,
+      name: dto.name,
+      slug: this._slugify(dto.name),
       denomination: dto.denomination ?? null,
       address: dto.address ?? null,
       phone: dto.phone ?? null,
       email: dto.email ?? null,
       logoUrl: dto.logoUrl ?? null,
-      parentChurchId: dto.parentChurchId ?? null,
+      parentChurchId: null,
     });
 
-    await this.usersService.setChurchAndRole(userId, church.id, role);
-    const user = await this.usersService.findById(userId);
-    const tokens = await this.authService.issueTokens(user!);
-    return { church, ...tokens };
+    await this.usersService.setChurchAndRole(
+      userId,
+      church.id,
+      user.role === UserRole.SUPER_ADMIN ? UserRole.SUPER_ADMIN : UserRole.SENIOR_PASTOR,
+    );
+    const fresh = await this.usersService.findById(userId);
+    return { church, ...(await this.authService.issueTokens(fresh!)) };
   }
 
-  async createBranch(parentChurchId: string, dto: { name: string; address?: string; city?: string; phone?: string }) {
-    const slug = this._slugify(dto.name);
+  createBranch(parentChurchId: string, dto: CreateBranchDto) {
     return this.create({
-      name: dto.name, slug,
+      name: dto.name.trim(),
+      slug: this._slugify(dto.name),
       address: dto.address ?? null,
       city: dto.city ?? null,
       phone: dto.phone ?? null,
@@ -96,7 +138,7 @@ export class ChurchesService {
       .createQueryBuilder('m')
       .select('m.churchId', 'cid')
       .addSelect('COUNT(m.id)', 'cnt')
-      .where('m.churchId IN (:...ids) AND m.status = :status', { ids, status: 'worker' })
+      .where('m.churchId IN (:...ids) AND m.status = :status', { ids, status: MemberStatus.WORKER })
       .groupBy('m.churchId')
       .getRawMany();
 
@@ -121,7 +163,6 @@ export class ChurchesService {
 
   async getBranchPastors(parentChurchId: string) {
     const branchIds = await this.getBranchIds(parentChurchId);
-    if (branchIds.length === 0) return [];
 
     return this.userRepo
       .createQueryBuilder('u')
@@ -131,10 +172,10 @@ export class ChurchesService {
       .getMany();
   }
 
-  async updateBranch(id: string, parentChurchId: string, data: Partial<Church>) {
+  async updateBranch(id: string, parentChurchId: string, data: UpdateBranchDto) {
     const branch = await this.repo.findOne({ where: { id, parentChurchId } });
     if (!branch) throw new NotFoundException('Branch not found');
-    await this.repo.update(id, data as any);
+    if (Object.keys(data).length) await this.repo.update(id, data as any);
     return this.findByIdOrFail(id);
   }
 
@@ -148,18 +189,30 @@ export class ChurchesService {
         `Cannot delete a branch with ${memberCount} member(s). Reassign members first.`,
       );
     }
+    const subBranches = await this.repo.count({ where: { parentChurchId: id } });
+    if (subBranches > 0) {
+      throw new BadRequestException('Cannot delete a branch that has its own sub-branches.');
+    }
 
-    await this.repo.remove(branch);
+    // Detach (not delete) the branch's pastor accounts so nobody keeps a token into a dead church.
+    await this.userRepo.update({ churchId: id }, { churchId: null } as any);
+    await this.repo.softRemove(branch);
   }
 
+  /** Moves an existing Branch Pastor (a User) to another branch of the same organisation. */
   async assignPastorToBranch(parentChurchId: string, pastorId: string, branchId: string) {
     const branchIds = await this.getBranchIds(parentChurchId);
-    if (!branchIds.includes(branchId)) throw new NotFoundException('Branch not found');
+    if (branchId === parentChurchId || !branchIds.includes(branchId)) {
+      throw new NotFoundException('Branch not found');
+    }
 
-    const pastor = await this.userRepo.findOne({ where: { id: pastorId } });
+    // Tenant scoping: the pastor must already belong to THIS organisation.
+    const pastor = await this.userRepo.findOne({
+      where: { id: pastorId, role: UserRole.BRANCH_PASTOR, churchId: In(branchIds) },
+    });
     if (!pastor) throw new NotFoundException('Pastor not found');
 
-    await this.userRepo.update(pastorId, { churchId: branchId } as any);
+    await this.userRepo.update(pastorId, { churchId: branchId });
     const branch = await this.repo.findOne({ where: { id: branchId } });
     return { success: true, branchName: branch?.name };
   }
@@ -167,69 +220,71 @@ export class ChurchesService {
   /**
    * Promotes a Member-source pastor to a real Branch Pastor User account.
    * This is what enables phone OTP login for member-registered pastors.
-   *
-   * Flow:
-   *  1. Validate branch belongs to this church
-   *  2. Load the Member record
-   *  3. Find or create a User with BRANCH_PASTOR role using the member's phone
-   *  4. Update the Member's status and churchId to match
    */
   async promoteMemberToBranchPastor(parentChurchId: string, memberId: string, branchId: string) {
-    // Verify branch
     const branchIds = await this.getBranchIds(parentChurchId);
-    if (!branchIds.includes(branchId)) throw new NotFoundException('Branch not found');
-
+    if (branchId === parentChurchId || !branchIds.includes(branchId)) {
+      throw new NotFoundException('Branch not found');
+    }
     const branch = await this.repo.findOneOrFail({ where: { id: branchId } });
 
-    // Load member
-    const member = await this.memberRepo.findOne({ where: { id: memberId } });
+    // Tenant scoping: the member must belong to this organisation.
+    const member = await this.memberRepo.findOne({ where: { id: memberId, churchId: In(branchIds) } });
     if (!member) throw new NotFoundException('Member not found');
-    if (!member.phone) {
+    if (!phoneDigitVariants(member.phone).length) {
       throw new BadRequestException(
-        'This pastor has no phone number on file. A phone number is required for Branch Pastor login access.',
+        'This pastor has no valid phone number on file. A phone number is required for Branch Pastor login access.',
       );
     }
 
-    // Find or create a User account with this phone number
-    const existing = await this.userRepo.findOne({ where: { phone: member.phone } });
+    // Look across ALL churches: a phone number identifies a person, and we must not
+    // silently take over an account that belongs to someone else's tenant.
+    const existing = await this.usersService.findByPhone(member.phone);
     let userId: string;
 
     if (existing) {
-      // Update existing user to branch pastor
+      const sameOrg = !!existing.churchId && branchIds.includes(existing.churchId);
+      if (!sameOrg || PROTECTED_ROLES.includes(existing.role)) {
+        throw new ConflictException(
+          'This phone number already belongs to another registered account, so it cannot be made a Branch Pastor. Use a different number or contact support.',
+        );
+      }
       await this.userRepo.update(existing.id, {
         role: UserRole.BRANCH_PASTOR,
         churchId: branchId,
         firstName: existing.firstName || member.firstName,
-        lastName:  existing.lastName  || member.lastName,
-      } as any);
+        lastName: existing.lastName || member.lastName,
+      });
       userId = existing.id;
     } else {
-      // Create a new User account — this enables phone OTP login.
-      // Branch Pastors authenticate via phone OTP only, so the passwordHash is
-      // set to a bcrypt hash of a random token they can never know or use.
-      const randomToken = Math.random().toString(36) + Date.now().toString(36);
-      const passwordHash = await bcrypt.hash(randomToken, 12);
+      // Branch Pastors sign in by phone OTP only. The password is a random value nobody knows.
+      const passwordHash = await bcrypt.hash(randomBytes(32).toString('hex'), BCRYPT_ROUNDS);
 
-      const newUser = this.userRepo.create({
-        firstName:    member.firstName,
-        lastName:     member.lastName,
-        phone:        member.phone,
-        role:         UserRole.BRANCH_PASTOR,
-        churchId:     branchId,
-        passwordHash,
-      } as any);
-      if (member.email) (newUser as any).email = member.email;
-      (newUser as any).isEmailVerified = true;
-      const saved = (await this.userRepo.save(newUser)) as unknown as User;
+      // Email is NOT NULL + unique. Use the member's if it is free, else a placeholder.
+      const memberEmail = member.email?.trim().toLowerCase();
+      const emailTaken = memberEmail ? !!(await this.usersService.findByEmail(memberEmail)) : true;
+      const email = memberEmail && !emailTaken ? memberEmail : `pastor-${member.id}@portal.internal`;
+
+      const saved = await this.userRepo.save(
+        this.userRepo.create({
+          firstName: member.firstName,
+          lastName: member.lastName,
+          phone: member.phone,
+          email,
+          role: UserRole.BRANCH_PASTOR,
+          churchId: branchId,
+          passwordHash,
+          isEmailVerified: true,
+        }),
+      );
       userId = saved.id;
     }
 
     // Sync member record to reflect the promotion
-    await this.memberRepo.update(memberId, {
-      churchId:  branchId,
-      status:    'pastor' as any,
-      churchRole:'branch_pastor' as any,
-    });
+    await this.memberRepo.update(
+      { id: memberId, churchId: In(branchIds) },
+      { churchId: branchId, status: MemberStatus.PASTOR, churchRole: ChurchRole.BRANCH_PASTOR },
+    );
 
     return {
       success: true,
@@ -239,15 +294,14 @@ export class ChurchesService {
     };
   }
 
+  /** The caller's own church plus its direct branches. */
   async getBranchIds(parentChurchId: string): Promise<string[]> {
     const branches = await this.repo.find({ where: { parentChurchId } });
     return [parentChurchId, ...branches.map((b) => b.id)];
   }
 
   private _slugify(name: string): string {
-    return (
-      name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') +
-      '-' + Date.now().toString(36)
-    );
+    const base = name.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '').replace(/^-+|-+$/g, '');
+    return `${base || 'church'}-${randomBytes(4).toString('hex')}`;
   }
 }

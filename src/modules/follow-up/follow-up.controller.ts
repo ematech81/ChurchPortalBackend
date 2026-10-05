@@ -1,14 +1,22 @@
-import { Controller, Get, Post, Patch, Param, Body, Query, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Param, Body, ParseUUIDPipe } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { FollowUpService } from './follow-up.service';
-import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import {
+  StartJourneyDto, AssignWorkerDto, UpdateJourneyStatusDto, NotifyWorkerDto,
+} from './dto/follow-up.dto';
 import { ChurchId } from '../../common/decorators/church-id.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
-import { JourneyStatus } from './follow-up-journey.entity';
+import { Roles } from '../../common/decorators/roles.decorator';
+import { UserRole } from '@/types';
+import { ADMIN_ROLES } from '../../constants/role-groups';
 
+type Caller = { id: string; firstName: string; lastName: string };
+
+// Managing follow-up (who is assigned to whom, login codes) is a pastor function.
+// Workers only get the two /worker/* routes below.
 @ApiTags('Follow-up')
 @ApiBearerAuth()
-@UseGuards(JwtAuthGuard)
+@Roles(...ADMIN_ROLES)
 @Controller('follow-up')
 export class FollowUpController {
   constructor(private readonly followUpService: FollowUpService) {}
@@ -31,49 +39,49 @@ export class FollowUpController {
   @Post('journeys')
   startJourney(
     @ChurchId() churchId: string,
-    @CurrentUser() caller: { id: string; firstName: string; lastName: string },
-    @Body() body: { memberId: string; decisionType: string; assignedWorkerId?: string },
+    @CurrentUser() caller: Caller,
+    @Body() dto: StartJourneyDto,
   ) {
     return this.followUpService.startJourney(
-      churchId, body.memberId, body.decisionType, body.assignedWorkerId, caller,
+      churchId, dto.memberId, dto.decisionType, dto.assignedWorkerId, caller,
     );
   }
 
   @Get('journeys/:id/tasks')
-  getTasks(@Param('id') id: string, @ChurchId() churchId: string) {
+  getTasks(@Param('id', ParseUUIDPipe) id: string, @ChurchId() churchId: string) {
     return this.followUpService.getJourneyTasks(id, churchId);
   }
 
   @Patch('journeys/:id/assign')
   assignWorker(
-    @Param('id') id: string,
+    @Param('id', ParseUUIDPipe) id: string,
     @ChurchId() churchId: string,
-    @CurrentUser() caller: { id: string; firstName: string; lastName: string },
-    @Body() body: { workerId: string },
+    @CurrentUser() caller: Caller,
+    @Body() dto: AssignWorkerDto,
   ) {
-    return this.followUpService.assignWorker(churchId, id, body.workerId, caller);
+    return this.followUpService.assignWorker(churchId, id, dto.workerId, caller);
   }
 
   @Patch('journeys/:id/status')
   updateStatus(
-    @Param('id') id: string,
+    @Param('id', ParseUUIDPipe) id: string,
     @ChurchId() churchId: string,
-    @Body() body: { status: JourneyStatus },
+    @Body() dto: UpdateJourneyStatusDto,
   ) {
-    return this.followUpService.updateJourneyStatus(churchId, id, body.status);
+    return this.followUpService.updateJourneyStatus(churchId, id, dto.status);
   }
 
   // ── Worker Portal ─────────────────────────────────────────────────────────
 
+  /** Any signed-in user may open the portal; it only ever shows work matched to their own phone/user. */
   @Get('worker/portal')
-  getWorkerPortal(
-    @CurrentUser() user: { id: string },
-    @ChurchId() churchId: string,
-  ) {
+  @Roles()
+  getWorkerPortal(@CurrentUser() user: { id: string }, @ChurchId() churchId: string) {
     return this.followUpService.getWorkerPortal(user.id, churchId);
   }
 
   @Post('worker/regenerate-code')
+  @Roles(UserRole.FOLLOW_UP_WORKER)
   regenerateCode(@CurrentUser() user: { id: string }) {
     return this.followUpService.regenerateWorkerCode(user.id);
   }
@@ -82,17 +90,17 @@ export class FollowUpController {
 
   @Post('workers/:workerId/notify')
   notifyWorker(
-    @Param('workerId') workerId: string,
+    @Param('workerId', ParseUUIDPipe) workerId: string,
     @ChurchId() churchId: string,
-    @CurrentUser() caller: { id: string; firstName: string; lastName: string },
-    @Body() body: { channel: 'whatsapp' | 'sms' | 'call'; journeyId?: string },
+    @CurrentUser() caller: Caller,
+    @Body() dto: NotifyWorkerDto,
   ) {
     return this.followUpService.notifyWorker(
-      workerId, churchId, caller.id, caller.lastName, body.channel, body.journeyId,
+      workerId, churchId, caller.id, caller.lastName, dto.channel, dto.journeyId,
     );
   }
 
-  // ── Dispatch log (Senior Pastor only) ────────────────────────────────────
+  // ── Dispatch log ──────────────────────────────────────────────────────────
 
   @Get('dispatch-log')
   getDispatchLog(@ChurchId() churchId: string) {

@@ -1,9 +1,10 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
-import { Repository, MoreThanOrEqual } from 'typeorm';
+import { Repository, MoreThanOrEqual, In, LessThan } from 'typeorm';
 import * as bcrypt from 'bcryptjs';
+import { randomBytes } from 'crypto';
 import { FollowUpJourney, JourneyStatus } from './follow-up-journey.entity';
 import { FollowUpTask, TaskStatus } from './follow-up-task.entity';
 import { WorkerCodeDispatchLog } from './worker-code-dispatch-log.entity';
@@ -12,6 +13,8 @@ import { User } from '../users/user.entity';
 import { Visit, VisitStatus } from '../visits/visit.entity';
 import { MemberStatus, UserRole } from '@/types';
 import { UsersService } from '../users/users.service';
+import { phoneDigitVariants, sqlDigits } from '../../common/utils/phone';
+import { BCRYPT_ROUNDS } from '../../common/utils/hash';
 import dayjs from 'dayjs';
 
 const DEFAULT_JOURNEY_STEPS = [
@@ -26,6 +29,12 @@ const DEFAULT_JOURNEY_STEPS = [
   { dayOffset: 42, type: 'check_status',  label: 'Journey graduation review' },
 ];
 
+/** A plaintext worker code is kept in the dispatch log this long, then wiped. */
+const CODE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Roles we are willing to upgrade into a follow-up worker. Anyone with a real role keeps their own login. */
+const UPGRADABLE_ROLES: string[] = [UserRole.MEMBER, UserRole.FOLLOW_UP_WORKER];
+
 // ── Message template builder ──────────────────────────────────────────────────
 // All templates stay in one place — swap content or add languages here later.
 
@@ -36,17 +45,17 @@ function buildTemplates(
   pastorLastName: string,
   loginCode: string | null,
 ) {
-  const code = loginCode ?? '(code previously sent)';
+  const codeLine = loginCode
+    ? `Your login code: *${loginCode}*\n\nOpen the app and tap the "Worker" login tab.`
+    : `Sign in to Kingdom Portal with your existing login.`;
+  const codeShort = loginCode ? `Kingdom Portal code: ${loginCode}. Open app > Worker tab.` : `Open Kingdom Portal to see your assignment.`;
   const phone = workerPhone?.replace(/\D/g, '') ?? '';
 
   const whatsapp =
     `Hi ${workerFirstName}! Pst. ${pastorLastName} has assigned you to follow up with ${memberName} on Kingdom Portal.\n\n` +
-    `Your login code: *${code}*\n\n` +
-    `Open the app and tap the "Worker" login tab. God bless!`;
+    `${codeLine} God bless!`;
 
-  const sms =
-    `Hi ${workerFirstName}, Pst. ${pastorLastName} assigned you: ${memberName}. ` +
-    `Kingdom Portal code: ${code}. Open app > Worker tab.`;
+  const sms = `Hi ${workerFirstName}, Pst. ${pastorLastName} assigned you: ${memberName}. ${codeShort}`;
 
   return {
     whatsapp,
@@ -63,6 +72,8 @@ function buildTemplates(
 
 @Injectable()
 export class FollowUpService {
+  private readonly logger = new Logger(FollowUpService.name);
+
   constructor(
     @InjectRepository(FollowUpJourney)
     private readonly journeyRepo: Repository<FollowUpJourney>,
@@ -80,74 +91,77 @@ export class FollowUpService {
     private readonly queue: Queue,
   ) {}
 
+  // ── Member lookups (always tenant-scoped) ─────────────────────────────────
+
+  private async _memberOrFail(id: string, churchId: string, what = 'Member'): Promise<Member> {
+    const m = await this.memberRepo.findOne({ where: { id, churchId } });
+    if (!m) throw new NotFoundException(`${what} not found`);
+    return m;
+  }
+
   // ── Ensure worker has a User account + login code ─────────────────────────
   // Returns the plaintext code ONLY when a new code was generated.
+  //
+  // Security: accounts are matched by phone WITHIN THIS CHURCH ONLY, and an account
+  // that already has a real role (pastor, admin, usher…) is never given a worker
+  // code — that code would be a second, weaker way to sign in as that person.
   private async _ensureWorkerCode(
     workerMember: Member,
     churchId: string,
   ): Promise<{ userId: string; loginCodePlain: string | null; isNewCode: boolean }> {
-    let loginCodePlain: string | null = null;
-    let isNewCode = false;
+    const variants = phoneDigitVariants(workerMember.phone);
 
-    // Search by phone (any role) first — avoids creating a duplicate user for a
-    // member who already has a User account under a different role (e.g. 'member').
-    let workerUser = workerMember.phone
-      ? await this.userRepo.findOne({ where: { phone: workerMember.phone } })
+    let workerUser = variants.length
+      ? await this.userRepo
+          .createQueryBuilder('u')
+          .addSelect('u.loginCodeHash')
+          .where(`${sqlDigits('u.phone')} IN (:...variants)`, { variants })
+          .andWhere('u.churchId = :churchId', { churchId })
+          .orderBy('u.createdAt', 'ASC')
+          .getOne()
       : null;
 
-    // Fallback: search by email if phone lookup found nothing
-    if (!workerUser && workerMember.email) {
-      workerUser = await this.userRepo.findOne({ where: { email: workerMember.email } });
+    if (workerUser && !UPGRADABLE_ROLES.includes(workerUser.role)) {
+      // e.g. the person is also a pastor: they use their own login, no code issued.
+      return { userId: workerUser.id, loginCodePlain: null, isNewCode: false };
     }
 
     if (!workerUser) {
-      // Truly no existing account — create one.
-      // Use a guaranteed-unique email: member UUID ensures no collision.
-      const randomToken = Math.random().toString(36) + Date.now().toString(36);
-      const passwordHash = await bcrypt.hash(randomToken, 12);
-      loginCodePlain = UsersService.generateLoginCode(workerMember.firstName);
-      const codeHash = UsersService.hashLoginCode(loginCodePlain);
-      isNewCode = true;
+      const passwordHash = await bcrypt.hash(randomBytes(32).toString('hex'), BCRYPT_ROUNDS);
+      const loginCodePlain = UsersService.generateLoginCode(workerMember.firstName);
 
-      workerUser = (await this.userRepo.save(
+      workerUser = await this.userRepo.save(
         this.userRepo.create({
-          firstName:          workerMember.firstName,
-          lastName:           workerMember.lastName,
-          phone:              workerMember.phone,
-          email:              workerMember.email ?? `worker-${workerMember.id}@portal.internal`,
-          role:               UserRole.FOLLOW_UP_WORKER,
+          firstName: workerMember.firstName,
+          lastName: workerMember.lastName,
+          phone: workerMember.phone,
+          // Worker accounts have no mailbox; a unique placeholder keeps the NOT NULL/unique column happy.
+          email: `worker-${workerMember.id}@portal.internal`,
+          role: UserRole.FOLLOW_UP_WORKER,
           churchId,
           passwordHash,
-          isEmailVerified:    true,
-          loginCodeHash:      codeHash,
+          isEmailVerified: true,
+          loginCodeHash: UsersService.hashLoginCode(loginCodePlain),
           loginCodeUpdatedAt: new Date(),
-        } as any),
-      )) as unknown as User;
-
-      console.log(`[DEV] New worker code for ${workerMember.firstName} ${workerMember.lastName}: ${loginCodePlain}`);
-    } else {
-      // Check if the user already has a code (loginCodeHash is hidden by default — query explicitly)
-      const userWithCode = await this.userRepo
-        .createQueryBuilder('u')
-        .addSelect('u.loginCodeHash')
-        .where('u.id = :id', { id: workerUser.id })
-        .getOne();
-
-      if (!userWithCode?.loginCodeHash) {
-        loginCodePlain = UsersService.generateLoginCode(workerMember.firstName);
-        const codeHash = UsersService.hashLoginCode(loginCodePlain);
-        isNewCode = true;
-
-        await this.userRepo.update(workerUser.id, {
-          loginCodeHash:      codeHash,
-          loginCodeUpdatedAt: new Date(),
-        } as any);
-
-        console.log(`[DEV] Generated code for existing worker ${workerMember.firstName}: ${loginCodePlain}`);
-      }
+        }),
+      );
+      return { userId: workerUser.id, loginCodePlain, isNewCode: true };
     }
 
-    return { userId: workerUser.id, loginCodePlain, isNewCode };
+    // Existing member-role or worker account in this church.
+    if (workerUser.role === UserRole.MEMBER) {
+      await this.userRepo.update(workerUser.id, { role: UserRole.FOLLOW_UP_WORKER });
+    }
+    if (!workerUser.loginCodeHash) {
+      const loginCodePlain = UsersService.generateLoginCode(workerMember.firstName);
+      await this.userRepo.update(workerUser.id, {
+        loginCodeHash: UsersService.hashLoginCode(loginCodePlain),
+        loginCodeUpdatedAt: new Date(),
+      } as any);
+      return { userId: workerUser.id, loginCodePlain, isNewCode: true };
+    }
+
+    return { userId: workerUser.id, loginCodePlain: null, isNewCode: false };
   }
 
   // ── Log a code dispatch event ─────────────────────────────────────────────
@@ -160,6 +174,11 @@ export class FollowUpService {
     churchId: string;
     channel?: string;
   }) {
+    // Opportunistic cleanup so plaintext codes don't live in the table forever.
+    await this.dispatchLogRepo.update(
+      { expiresAt: LessThan(new Date()) },
+      { code: null },
+    );
     await this.dispatchLogRepo.save(
       this.dispatchLogRepo.create({
         workerId:   opts.workerId,
@@ -169,7 +188,7 @@ export class FollowUpService {
         assignedBy: opts.assignedBy,
         churchId:   opts.churchId,
         channel:    opts.channel ?? 'pending_manual',
-        expiresAt:  new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        expiresAt:  new Date(Date.now() + CODE_RETENTION_MS),
       }),
     );
   }
@@ -183,19 +202,42 @@ export class FollowUpService {
     assignedWorkerId?: string,
     caller?: { id: string; firstName: string; lastName: string },
   ) {
-    const existing = await this.journeyRepo.findOne({
+    const targetMember = await this._memberOrFail(memberId, churchId);
+    const workerMember = assignedWorkerId
+      ? await this._memberOrFail(assignedWorkerId, churchId, 'Worker')
+      : null;
+
+    let journey = await this.journeyRepo.findOne({
       where: { churchId, memberId, status: JourneyStatus.ACTIVE },
     });
-    if (existing) return { journey: existing, worker: null, messageTemplates: null };
 
-    const journey = await this.journeyRepo.save(
-      this.journeyRepo.create({ churchId, memberId, decisionType, assignedWorkerId: assignedWorkerId ?? null }),
-    );
+    if (journey) {
+      // A journey already exists. Without a new worker there is nothing to do; with
+      // one, this is a (re)assignment and must actually take effect.
+      if (!workerMember) return { journey, worker: null, messageTemplates: null };
+      await this.journeyRepo.update({ id: journey.id, churchId }, { assignedWorkerId: workerMember.id });
+      journey = (await this.journeyRepo.findOne({ where: { id: journey.id, churchId } }))!;
+    } else {
+      journey = await this.journeyRepo.save(
+        this.journeyRepo.create({
+          churchId,
+          memberId,
+          decisionType,
+          assignedWorkerId: workerMember?.id ?? null,
+        }),
+      );
+      await this._scheduleTasks(churchId, journey.id);
+    }
 
+    if (!workerMember || !caller) return { journey, worker: null, messageTemplates: null };
+    return this._buildAssignmentResult(journey, workerMember, targetMember, churchId, caller);
+  }
+
+  private async _scheduleTasks(churchId: string, journeyId: string) {
     const now = dayjs();
     const tasks = DEFAULT_JOURNEY_STEPS.map((step) =>
       this.taskRepo.create({
-        churchId, journeyId: journey.id,
+        churchId, journeyId,
         type: step.type as never,
         triggerAt: now.add(step.dayOffset, 'day').toDate(),
         payload: { label: step.label },
@@ -205,57 +247,64 @@ export class FollowUpService {
     for (const task of savedTasks) {
       try {
         const delay = Math.max(0, task.triggerAt.getTime() - Date.now());
-        await this.queue.add('process-task', { taskId: task.id }, { delay });
-      } catch { /* queue unavailable in dev */ }
-    }
-
-    // If a worker is assigned, generate their code and build notification templates
-    if (assignedWorkerId && caller) {
-      const [workerMember, targetMember] = await Promise.all([
-        this.memberRepo.findOne({ where: { id: assignedWorkerId, churchId } }),
-        this.memberRepo.findOne({ where: { id: memberId, churchId } }),
-      ]);
-
-      if (workerMember) {
-        const { loginCodePlain, isNewCode } = await this._ensureWorkerCode(workerMember, churchId);
-
-        await this._logDispatch({
-          workerId:   assignedWorkerId,
-          workerName: `${workerMember.firstName} ${workerMember.lastName}`,
-          workerPhone: workerMember.phone,
-          code:       loginCodePlain,
-          assignedBy: caller.id,
-          churchId,
-        });
-
-        const memberName = targetMember
-          ? `${targetMember.firstName} ${targetMember.lastName}`
-          : 'your assigned member';
-
-        const messageTemplates = buildTemplates(
-          workerMember.firstName,
-          workerMember.phone,
-          memberName,
-          caller.lastName,
-          loginCodePlain,
-        );
-
-        return {
-          journey,
-          worker: {
-            id:                   assignedWorkerId,
-            name:                 `${workerMember.firstName} ${workerMember.lastName}`,
-            phone:                workerMember.phone,
-            isNewCode,
-            loginCode:            loginCodePlain,
-            loginCodeGeneratedAt: new Date().toISOString(),
+        await this.queue.add(
+          'process-task',
+          { taskId: task.id },
+          {
+            delay,
+            attempts: 3,
+            backoff: { type: 'exponential', delay: 60_000 },
+            removeOnComplete: true,
+            removeOnFail: 200,
           },
-          messageTemplates,
-        };
+        );
+      } catch (err: any) {
+        // The task row stays PENDING; a reconciler can re-enqueue it. Never fail the request over this.
+        this.logger.warn(`Could not enqueue task ${task.id}: ${err?.message ?? err}`);
       }
     }
+  }
 
-    return { journey, worker: null, messageTemplates: null };
+  private async _buildAssignmentResult(
+    journey: FollowUpJourney,
+    workerMember: Member,
+    targetMember: Member | null,
+    churchId: string,
+    caller: { id: string; firstName: string; lastName: string },
+  ) {
+    const { loginCodePlain, isNewCode } = await this._ensureWorkerCode(workerMember, churchId);
+
+    await this._logDispatch({
+      workerId:   workerMember.id,
+      workerName: `${workerMember.firstName} ${workerMember.lastName}`,
+      workerPhone: workerMember.phone,
+      code:       loginCodePlain,
+      assignedBy: caller.id,
+      churchId,
+    });
+
+    const memberName = targetMember
+      ? `${targetMember.firstName} ${targetMember.lastName}`
+      : 'your assigned member';
+
+    return {
+      journey,
+      worker: {
+        id:                   workerMember.id,
+        name:                 `${workerMember.firstName} ${workerMember.lastName}`,
+        phone:                workerMember.phone,
+        isNewCode,
+        loginCode:            loginCodePlain,
+        loginCodeGeneratedAt: new Date().toISOString(),
+      },
+      messageTemplates: buildTemplates(
+        workerMember.firstName,
+        workerMember.phone,
+        memberName,
+        caller.lastName,
+        loginCodePlain,
+      ),
+    };
   }
 
   // ── notifyWorker — log intent + return deep-links ─────────────────────────
@@ -268,32 +317,28 @@ export class FollowUpService {
     channel: 'whatsapp' | 'sms' | 'call',
     journeyId?: string,
   ) {
-    const workerMember = await this.memberRepo.findOne({ where: { id: workerId, churchId } });
-    if (!workerMember) throw new Error('Worker not found');
+    const workerMember = await this._memberOrFail(workerId, churchId, 'Worker');
 
-    // Get the most recent dispatch log entry to retrieve the current code
+    // Most recent dispatch with a still-retained code, so we can re-send it.
     const latestLog = await this.dispatchLogRepo.findOne({
       where: { workerId, churchId },
       order: { createdAt: 'DESC' },
     });
+    const liveCode = latestLog?.code && latestLog.expiresAt && latestLog.expiresAt > new Date()
+      ? latestLog.code
+      : null;
 
-    // Find member context
+    // Member context
     let memberName = 'your assigned member';
-    if (journeyId) {
-      const journey = await this.journeyRepo.findOne({ where: { id: journeyId, churchId } });
-      if (journey) {
-        const m = await this.memberRepo.findOne({ where: { id: journey.memberId } });
-        if (m) memberName = `${m.firstName} ${m.lastName}`;
-      }
-    } else {
-      const journey = await this.journeyRepo.findOne({
-        where: { assignedWorkerId: workerId, churchId, status: JourneyStatus.ACTIVE },
-        order: { createdAt: 'DESC' },
-      });
-      if (journey) {
-        const m = await this.memberRepo.findOne({ where: { id: journey.memberId } });
-        if (m) memberName = `${m.firstName} ${m.lastName}`;
-      }
+    const journey = journeyId
+      ? await this.journeyRepo.findOne({ where: { id: journeyId, churchId } })
+      : await this.journeyRepo.findOne({
+          where: { assignedWorkerId: workerId, churchId, status: JourneyStatus.ACTIVE },
+          order: { createdAt: 'DESC' },
+        });
+    if (journey) {
+      const m = await this.memberRepo.findOne({ where: { id: journey.memberId, churchId } });
+      if (m) memberName = `${m.firstName} ${m.lastName}`;
     }
 
     const templates = buildTemplates(
@@ -301,15 +346,14 @@ export class FollowUpService {
       workerMember.phone,
       memberName,
       callerLastName,
-      latestLog?.code ?? null,
+      liveCode,
     );
 
-    // Log the notification attempt
     await this._logDispatch({
       workerId,
       workerName: `${workerMember.firstName} ${workerMember.lastName}`,
       workerPhone: workerMember.phone,
-      code: latestLog?.code ?? null,
+      code: liveCode,
       assignedBy: callerId,
       churchId,
       channel,
@@ -326,7 +370,7 @@ export class FollowUpService {
     };
   }
 
-  // ── getDispatchLog (Senior Pastor view) ───────────────────────────────────
+  // ── getDispatchLog ────────────────────────────────────────────────────────
 
   async getDispatchLog(churchId: string) {
     const logs = await this.dispatchLogRepo.find({
@@ -361,56 +405,20 @@ export class FollowUpService {
     workerId: string,
     caller?: { id: string; firstName: string; lastName: string },
   ) {
-    await this.journeyRepo.update({ id: journeyId, churchId }, { assignedWorkerId: workerId });
-    const journey = await this.journeyRepo.findOne({ where: { id: journeyId, churchId } });
+    const existing = await this.journeyRepo.findOne({ where: { id: journeyId, churchId } });
+    if (!existing) throw new NotFoundException('Journey not found');
+    const workerMember = await this._memberOrFail(workerId, churchId, 'Worker');
+
+    await this.journeyRepo.update({ id: journeyId, churchId }, { assignedWorkerId: workerMember.id });
+    const journey = (await this.journeyRepo.findOne({ where: { id: journeyId, churchId } }))!;
 
     if (!caller) return { journey, worker: null, messageTemplates: null };
 
-    const [workerMember, targetMember] = await Promise.all([
-      this.memberRepo.findOne({ where: { id: workerId, churchId } }),
-      journey ? this.memberRepo.findOne({ where: { id: journey.memberId } }) : null,
-    ]);
-
-    if (!workerMember) return { journey, worker: null, messageTemplates: null };
-
-    const { loginCodePlain, isNewCode } = await this._ensureWorkerCode(workerMember, churchId);
-
-    await this._logDispatch({
-      workerId,
-      workerName:  `${workerMember.firstName} ${workerMember.lastName}`,
-      workerPhone: workerMember.phone,
-      code:        loginCodePlain,
-      assignedBy:  caller.id,
-      churchId,
-    });
-
-    const memberName = targetMember
-      ? `${targetMember.firstName} ${targetMember.lastName}`
-      : 'your assigned member';
-
-    const messageTemplates = buildTemplates(
-      workerMember.firstName,
-      workerMember.phone,
-      memberName,
-      caller.lastName,
-      loginCodePlain,
-    );
-
-    return {
-      journey,
-      worker: {
-        id: workerId,
-        name: `${workerMember.firstName} ${workerMember.lastName}`,
-        phone: workerMember.phone,
-        isNewCode,
-        loginCode: loginCodePlain,
-        loginCodeGeneratedAt: new Date().toISOString(),
-      },
-      messageTemplates,
-    };
+    const targetMember = await this.memberRepo.findOne({ where: { id: journey.memberId, churchId } });
+    return this._buildAssignmentResult(journey, workerMember, targetMember, churchId, caller);
   }
 
-  // ── Existing methods unchanged ────────────────────────────────────────────
+  // ── Queries ───────────────────────────────────────────────────────────────
 
   async getFollowUpQueue(churchId: string) {
     const activeJourneyMemberIds = await this.journeyRepo
@@ -440,7 +448,7 @@ export class FollowUpService {
     if (!journeys.length) return [];
 
     const memberIds = journeys.map((j) => j.memberId).filter(Boolean);
-    const members = memberIds.length ? await this.memberRepo.findByIds(memberIds) : [];
+    const members = memberIds.length ? await this.memberRepo.findBy({ id: In(memberIds), churchId }) : [];
     const memberMap = new Map(members.map((m) => [m.id, m]));
 
     const taskCounts = await this.taskRepo
@@ -474,6 +482,8 @@ export class FollowUpService {
   }
 
   async updateJourneyStatus(churchId: string, journeyId: string, status: JourneyStatus) {
+    const journey = await this.journeyRepo.findOne({ where: { id: journeyId, churchId } });
+    if (!journey) throw new NotFoundException('Journey not found');
     const update: Partial<FollowUpJourney> = { status };
     if (status === JourneyStatus.COMPLETED) update.completedAt = new Date();
     await this.journeyRepo.update({ id: journeyId, churchId }, update as any);
@@ -493,17 +503,29 @@ export class FollowUpService {
     return { active, completed, queueCount };
   }
 
+  // ── Worker portal ─────────────────────────────────────────────────────────
+
+  /** The Member record that corresponds to a signed-in user, matched by phone within the church. */
+  private async _memberForUser(user: User, churchId: string): Promise<Member | null> {
+    const variants = phoneDigitVariants(user.phone);
+    if (!variants.length) return null; // never query with an empty filter
+    return this.memberRepo
+      .createQueryBuilder('m')
+      .where('m.churchId = :churchId', { churchId })
+      .andWhere(`${sqlDigits('m.phone')} IN (:...variants)`, { variants })
+      .orderBy('m.createdAt', 'ASC')
+      .getOne();
+  }
+
   async getWorkerPortal(workerUserId: string, churchId: string) {
     const workerUser = await this.userRepo.findOne({ where: { id: workerUserId } });
-    if (!workerUser) return null;
+    if (!workerUser) throw new NotFoundException('Account not found');
 
-    const workerMember = await this.memberRepo.findOne({
-      where: { phone: workerUser.phone ?? undefined, churchId },
-    });
-    const workerId = workerMember?.id;
+    const workerMember = await this._memberForUser(workerUser, churchId);
+    const workerId = workerMember?.id; // journeys point at the worker's MEMBER id
 
     const today = dayjs().startOf('day').toDate();
-    const tomorrow = dayjs().endOf('day').toDate();
+    const endOfToday = dayjs().endOf('day').toDate();
 
     const [journeys, visits] = await Promise.all([
       workerId
@@ -512,17 +534,16 @@ export class FollowUpService {
             order: { createdAt: 'DESC' },
           })
         : [],
-      workerId
-        ? this.visitRepo.find({
-            where: { workerId, churchId, status: VisitStatus.SCHEDULED, scheduledAt: MoreThanOrEqual(new Date()) },
-            order: { scheduledAt: 'ASC' },
-            take: 10,
-          })
-        : [],
+      // Visits are owned by the signed-in USER (see VisitsService.create), not the member record.
+      this.visitRepo.find({
+        where: { workerId: workerUserId, churchId, status: VisitStatus.SCHEDULED, scheduledAt: MoreThanOrEqual(new Date()) },
+        order: { scheduledAt: 'ASC' },
+        take: 10,
+      }),
     ]);
 
     const memberIds = journeys.map((j) => j.memberId).filter(Boolean);
-    const members = memberIds.length ? await this.memberRepo.findByIds(memberIds) : [];
+    const members = memberIds.length ? await this.memberRepo.findBy({ id: In(memberIds), churchId }) : [];
     const memberMap = new Map(members.map((m) => [m.id, m]));
 
     const taskCounts = journeys.length
@@ -531,7 +552,7 @@ export class FollowUpService {
           .select('t.journeyId', 'journeyId')
           .addSelect('COUNT(*)', 'total')
           .addSelect(`SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END)`, 'done')
-          .where('t.journeyId IN (:...ids)', { ids: journeys.map((j) => j.id) })
+          .where('t.churchId = :churchId AND t.journeyId IN (:...ids)', { churchId, ids: journeys.map((j) => j.id) })
           .groupBy('t.journeyId')
           .getRawMany()
       : [];
@@ -541,7 +562,7 @@ export class FollowUpService {
     );
 
     const todaysTasks = journeys
-      .filter((j) => j.urgent || (j.dueDate && j.dueDate >= today && j.dueDate <= tomorrow))
+      .filter((j) => j.urgent || (j.dueDate && j.dueDate >= today && j.dueDate <= endOfToday))
       .map((j) => ({ ...j, member: memberMap.get(j.memberId) ?? null }));
 
     const urgentCount = todaysTasks.filter((t) => t.urgent).length;
@@ -578,19 +599,19 @@ export class FollowUpService {
 
   async regenerateWorkerCode(workerUserId: string) {
     const user = await this.userRepo.findOne({ where: { id: workerUserId } });
-    if (!user) throw new Error('Worker not found');
+    if (!user) throw new NotFoundException('Worker not found');
+    if (user.role !== UserRole.FOLLOW_UP_WORKER) {
+      throw new BadRequestException('Only follow-up worker accounts have a login code.');
+    }
 
     const newCode = UsersService.generateLoginCode(user.firstName);
-    const codeHash = UsersService.hashLoginCode(newCode);
-
     await this.userRepo.update(workerUserId, {
-      loginCodeHash: codeHash,
+      loginCodeHash: UsersService.hashLoginCode(newCode),
       loginCodeUpdatedAt: new Date(),
       loginCodeFailedAttempts: 0,
       loginCodeLockedUntil: null,
     } as any);
 
-    console.log(`[DEV] Regenerated worker code for ${user.firstName}: ${newCode}`);
     return { loginCodePlain: newCode, updatedAt: new Date() };
   }
 }

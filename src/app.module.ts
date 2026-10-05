@@ -1,7 +1,9 @@
 import { Module } from '@nestjs/common';
+import { join } from 'path';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { ThrottlerModule } from '@nestjs/throttler';
+import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { APP_GUARD } from '@nestjs/core';
 import { BullModule } from '@nestjs/bullmq';
 import { AppController } from './app.controller';
 import { AuthModule } from './modules/auth/auth.module';
@@ -24,7 +26,9 @@ import { VisitsModule } from './modules/visits/visits.module';
 import { MinistryGroupsModule } from './modules/ministry-groups/ministry-groups.module';
 import appConfig from './config/app.config';
 import databaseConfig from './config/database.config';
-import redisConfig from './config/redis.config';
+import redisConfig, { parseRedisUrl } from './config/redis.config';
+import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
+import { RolesGuard } from './common/guards/roles.guard';
 
 @Module({
   imports: [
@@ -36,34 +40,41 @@ import redisConfig from './config/redis.config';
 
     TypeOrmModule.forRootAsync({
       inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        type: 'postgres',
-        url: config.get('database.url'),
-        autoLoadEntities: true,
-        synchronize: config.get('NODE_ENV') === 'development',
-        logging: config.get('NODE_ENV') === 'development',
-        migrations: ['dist/database/migrations/*.js'],
-        ssl: config.get('database.url')?.includes('neon.tech')
-          ? { rejectUnauthorized: false }
-          : false,
-      }),
+      useFactory: (config: ConfigService) => {
+        const env = config.get<string>('NODE_ENV');
+        // Schema sync is opt-in. For backwards compatibility it still defaults on
+        // in NODE_ENV=development when DB_SYNCHRONIZE is unset. Production should
+        // set DB_SYNCHRONIZE=false and DB_RUN_MIGRATIONS=true.
+        const syncFlag = config.get<string>('DB_SYNCHRONIZE');
+        const synchronize = syncFlag !== undefined ? syncFlag === 'true' : env === 'development';
+        const url = config.get<string>('database.url');
+        return {
+          type: 'postgres' as const,
+          url,
+          autoLoadEntities: true,
+          synchronize,
+          logging: config.get('DB_LOGGING') === 'true',
+          migrations: [join(__dirname, 'database/migrations/*.{js,ts}')],
+          migrationsRun: config.get('DB_RUN_MIGRATIONS') === 'true',
+          ssl: url && /neon\.tech|sslmode=require/.test(url) ? { rejectUnauthorized: false } : false,
+        };
+      },
     }),
 
     BullModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
         prefix: 'church-portal',
-        connection: {
-          url: config.get('redis.url'),
-          tls: {},
-        },
+        connection: parseRedisUrl(config.get<string>('redis.url')!),
       }),
     }),
 
+    // Per-IP limits (main.ts sets `trust proxy` so this is the real client IP).
+    // Auth routes tighten these further with @Throttle on the controller.
     ThrottlerModule.forRoot([
-      { name: 'short', ttl: 1000, limit: 10 },
-      { name: 'medium', ttl: 10000, limit: 50 },
-      { name: 'long', ttl: 60000, limit: 200 },
+      { name: 'short', ttl: 1000, limit: 20 },
+      { name: 'medium', ttl: 10000, limit: 100 },
+      { name: 'long', ttl: 60000, limit: 300 },
     ]),
 
     MailModule,
@@ -86,5 +97,11 @@ import redisConfig from './config/redis.config';
     MinistryGroupsModule,
   ],
   controllers: [AppController],
+  providers: [
+    // Order matters: throttle first, then authenticate, then authorize by role.
+    { provide: APP_GUARD, useClass: ThrottlerGuard },
+    { provide: APP_GUARD, useClass: JwtAuthGuard },
+    { provide: APP_GUARD, useClass: RolesGuard },
+  ],
 })
 export class AppModule {}

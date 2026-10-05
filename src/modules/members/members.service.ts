@@ -1,24 +1,63 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, ILike } from 'typeorm';
+import { Repository, ILike, In } from 'typeorm';
 import { Member } from './member.entity';
-import { MemberStatus, MembershipCategory } from '@/types';
+import { Church } from '../churches/church.entity';
+import { MemberStatus, MembershipCategory, UserRole } from '@/types';
 import { PASTOR_CHURCH_ROLES } from '../../constants/pastor-roles';
+import { pick } from '../../common/utils/pick';
+
+/**
+ * Client-writable member columns. Anything not listed (id, churchId, memberId,
+ * createdById, updatedById, deletedAt…) is server-controlled and silently dropped.
+ */
+const WRITABLE_FIELDS = [
+  'firstName', 'lastName', 'middleName', 'gender', 'dateOfBirth', 'maritalStatus', 'occupation',
+  'photoUrl', 'phone', 'alternatePhone', 'email', 'address', 'city', 'state', 'preferredLanguage',
+  'emergencyContactName', 'emergencyContactPhone', 'status', 'baptismStatus', 'baptismDate',
+  'holyGhostBaptism', 'salvationDate', 'membershipDate', 'membershipCategory', 'churchRole',
+  'pastoralPosition', 'customRole', 'departmentName', 'departmentRole', 'departmentJoinedDate',
+  'parentGuardianName', 'parentGuardianPhone', 'ageRange', 'pickupAuthorization', 'familyId',
+  'householdId', 'householdRole', 'cellGroupId', 'tags', 'whatsappOptIn', 'smsOptIn',
+  'decisionType', 'invitedBy', 'latitude', 'longitude', 'customFields',
+] as const;
+
+const STATUS_FILTERS = new Set<string>([...Object.values(MemberStatus), 'all', 'pastoral']);
+
+/** Escape LIKE wildcards so a search for "100%" or "a_b" is literal. */
+const escapeLike = (v: string) => v.replace(/[\\%_]/g, (c) => '\\' + c);
+
+/** One church id, or several (a Senior Pastor looking across all of their branches). */
+export type Scope = string | string[];
+const ids = (scope: Scope) => (Array.isArray(scope) ? scope : [scope]);
 
 @Injectable()
 export class MembersService {
   constructor(
     @InjectRepository(Member)
     private readonly repo: Repository<Member>,
+    @InjectRepository(Church)
+    private readonly churchRepo: Repository<Church>,
   ) {}
+
+  /**
+   * Which churches a request may see. A Senior Pastor may ask for the whole organisation
+   * (their church + direct branches); everyone else — including Branch Pastors — is
+   * always limited to their own church, whatever the client asks for.
+   */
+  async resolveScope(churchId: string, role: string, wholeOrg: boolean): Promise<Scope> {
+    if (!wholeOrg || (role !== UserRole.SENIOR_PASTOR && role !== UserRole.SUPER_ADMIN)) return churchId;
+    const branches = await this.churchRepo.find({ where: { parentChurchId: churchId }, select: ['id'] });
+    return [churchId, ...branches.map((b) => b.id)];
+  }
 
   // ── Pastor query ──────────────────────────────────────────────────────────────
   // A member is a pastor if their status is 'pastor' OR their churchRole is one
   // of the canonical pastoral roles. No other field qualifies them.
-  private pastorQb(churchId: string) {
+  private pastorQb(scope: Scope) {
     return this.repo
       .createQueryBuilder('m')
-      .where('m.churchId = :churchId', { churchId })
+      .where('m.churchId IN (:...scopeIds)', { scopeIds: ids(scope) })
       .andWhere(
         '(m.status = :pStatus OR m.churchRole IN (:...pRoles))',
         { pStatus: MemberStatus.PASTOR, pRoles: PASTOR_CHURCH_ROLES },
@@ -28,10 +67,10 @@ export class MembersService {
   // ── Minister query ────────────────────────────────────────────────────────────
   // A minister has status='minister' and does NOT also hold a pastoral church role.
   // Pastors and Ministers are mutually exclusive tabs.
-  private ministerQb(churchId: string) {
+  private ministerQb(scope: Scope) {
     return this.repo
       .createQueryBuilder('m')
-      .where('m.churchId = :churchId', { churchId })
+      .where('m.churchId IN (:...scopeIds)', { scopeIds: ids(scope) })
       .andWhere('m.status = :mStatus', { mStatus: MemberStatus.MINISTER })
       .andWhere(
         '(m.churchRole IS NULL OR m.churchRole NOT IN (:...pRoles))',
@@ -40,21 +79,22 @@ export class MembersService {
   }
 
   // ── findAll ───────────────────────────────────────────────────────────────────
-  async findAll(churchId: string, search?: string, status?: string, limit = 100) {
-    const take = Math.min(limit, 500);
-    const s = search?.trim();
+  async findAll(scope: Scope, search?: string, status?: string, limit?: number) {
+    if (status && !STATUS_FILTERS.has(status)) throw new BadRequestException('Unknown status filter.');
+    const take = Math.min(Number.isFinite(limit) && limit! > 0 ? limit! : 100, 500);
+    const s = search?.trim() ? escapeLike(search.trim()) : undefined;
     const searchClause = s
       ? '(m.firstName ILIKE :s OR m.lastName ILIKE :s OR m.phone ILIKE :s OR m.email ILIKE :s)'
       : null;
 
     if (status === 'pastor' || status === 'pastoral') {
-      const qb = this.pastorQb(churchId).orderBy('m.firstName', 'ASC').take(take);
+      const qb = this.pastorQb(scope).orderBy('m.firstName', 'ASC').take(take);
       if (searchClause) qb.andWhere(searchClause, { s: `%${s}%` });
       return qb.getMany();
     }
 
     if (status === 'minister') {
-      const qb = this.ministerQb(churchId).orderBy('m.firstName', 'ASC').take(take);
+      const qb = this.ministerQb(scope).orderBy('m.firstName', 'ASC').take(take);
       if (searchClause) qb.andWhere(searchClause, { s: `%${s}%` });
       return qb.getMany();
     }
@@ -62,7 +102,7 @@ export class MembersService {
     const statusFilter = status && status !== 'all' ? (status as MemberStatus) : undefined;
 
     if (s) {
-      const base = { churchId, ...(statusFilter ? { status: statusFilter } : {}) };
+      const base = { churchId: In(ids(scope)), ...(statusFilter ? { status: statusFilter } : {}) };
       return this.repo.find({
         where: [
           { ...base, firstName: ILike(`%${s}%`) },
@@ -77,34 +117,41 @@ export class MembersService {
     }
 
     return this.repo.find({
-      where: { churchId, ...(statusFilter ? { status: statusFilter } : {}) },
+      where: { churchId: In(ids(scope)), ...(statusFilter ? { status: statusFilter } : {}) },
       order: { firstName: 'ASC' },
       take,
     });
   }
 
   // ── count ─────────────────────────────────────────────────────────────────────
-  async count(churchId: string, status?: string) {
-    if (status === 'pastor' || status === 'pastoral') return this.pastorQb(churchId).getCount();
-    if (status === 'minister') return this.ministerQb(churchId).getCount();
+  async count(scope: Scope, status?: string) {
+    if (status && !STATUS_FILTERS.has(status)) throw new BadRequestException('Unknown status filter.');
+    if (status === 'pastor' || status === 'pastoral') return this.pastorQb(scope).getCount();
+    if (status === 'minister') return this.ministerQb(scope).getCount();
     const statusFilter = status && status !== 'all' ? (status as MemberStatus) : undefined;
-    return this.repo.count({ where: { churchId, ...(statusFilter ? { status: statusFilter } : {}) } });
+    return this.repo.count({ where: { churchId: In(ids(scope)), ...(statusFilter ? { status: statusFilter } : {}) } });
   }
 
   // ── countPastors (dashboard stat) ────────────────────────────────────────────
-  async countPastors(churchId: string): Promise<number> {
-    return this.pastorQb(churchId).getCount();
+  async countPastors(scope: Scope): Promise<number> {
+    return this.pastorQb(scope).getCount();
   }
 
   // ── findByIdOrFail ────────────────────────────────────────────────────────────
-  async findByIdOrFail(id: string, churchId: string) {
-    const member = await this.repo.findOne({ where: { id, churchId } });
+  async findByIdOrFail(id: string, scope: Scope) {
+    const member = await this.repo.findOne({ where: { id, churchId: In(ids(scope)) } });
     if (!member) throw new NotFoundException('Member not found');
     return member;
   }
 
   // ── create ────────────────────────────────────────────────────────────────────
-  async create(churchId: string, data: Partial<Member>) {
+  async create(churchId: string, body: Record<string, unknown>, userId: string) {
+    const data = pick<Member>(body, WRITABLE_FIELDS);
+    for (const f of ['firstName', 'lastName', 'phone'] as const) {
+      if (typeof data[f] !== 'string' || !(data[f] as string).trim()) {
+        throw new BadRequestException(`${f} is required.`);
+      }
+    }
     if (
       data.churchRole &&
       PASTOR_CHURCH_ROLES.includes(data.churchRole as string) &&
@@ -113,22 +160,29 @@ export class MembersService {
       data.status = MemberStatus.PASTOR;
     }
     const memberId = await this._generateMemberId(churchId);
-    return this.repo.save(this.repo.create({ ...data, churchId, memberId }));
+    return this.repo.save(
+      this.repo.create({ ...data, churchId, memberId, createdById: userId, updatedById: userId }),
+    );
   }
 
   // ── update ────────────────────────────────────────────────────────────────────
-  async update(id: string, churchId: string, data: Partial<Member>) {
+  async update(id: string, scope: Scope, body: Record<string, unknown>, userId: string) {
+    const data = pick<Member>(body, WRITABLE_FIELDS);
+    const existing = await this.findByIdOrFail(id, scope); // 404 before touching anything
+    const churchId = existing.churchId;
     if (
       data.churchRole &&
       PASTOR_CHURCH_ROLES.includes(data.churchRole as string) &&
       data.status !== MemberStatus.PASTOR
     ) {
-      const existing = await this.repo.findOne({ where: { id, churchId } });
-      if (existing && existing.status !== MemberStatus.PASTOR) {
-        data.status = MemberStatus.PASTOR;
+      data.status = MemberStatus.PASTOR;
+    }
+    for (const f of ['firstName', 'lastName', 'phone'] as const) {
+      if (f in data && (typeof data[f] !== 'string' || !(data[f] as string).trim())) {
+        throw new BadRequestException(`${f} cannot be empty.`);
       }
     }
-    await this.repo.update({ id, churchId }, data as any);
+    await this.repo.update({ id, churchId }, { ...data, updatedById: userId } as any);
     return this.findByIdOrFail(id, churchId);
   }
 
@@ -198,11 +252,11 @@ export class MembersService {
   // delete members whose churchId matches their own JWT churchId claim.
   async softDelete(
     id: string,
-    churchId: string,
+    scope: Scope,
     caller: { userId: string; role: string },
   ) {
-    const member = await this.repo.findOne({ where: { id, churchId } });
-    if (!member) throw new NotFoundException('Member not found');
+    const member = await this.findByIdOrFail(id, scope);
+    const churchId = member.churchId;
 
     await this.repo.softDelete({ id, churchId });
 
@@ -219,9 +273,18 @@ export class MembersService {
   }
 
   // ── _generateMemberId ─────────────────────────────────────────────────────────
+  // Next number after the highest ever issued this year — counting soft-deleted rows,
+  // so deleting a member never causes the next one to reuse an existing ID.
   private async _generateMemberId(churchId: string): Promise<string> {
     const year = new Date().getFullYear();
-    const count = await this.repo.count({ where: { churchId } });
-    return `KP-${year}-${String(count + 1).padStart(5, '0')}`;
+    const prefix = `KP-${year}-`;
+    const row = await this.repo
+      .createQueryBuilder('m')
+      .withDeleted()
+      .select(`MAX(CAST(SUBSTRING(m.memberId FROM '[0-9]+$') AS INTEGER))`, 'max')
+      .where('m.churchId = :churchId AND m.memberId LIKE :like', { churchId, like: `${prefix}%` })
+      .getRawOne();
+    const next = (parseInt(row?.max ?? '0', 10) || 0) + 1;
+    return `${prefix}${String(next).padStart(5, '0')}`;
   }
 }

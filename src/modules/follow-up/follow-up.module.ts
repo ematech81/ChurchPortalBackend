@@ -10,10 +10,13 @@ import { WorkerCodeDispatchLog } from './worker-code-dispatch-log.entity';
 import { FollowUpService } from './follow-up.service';
 import { FollowUpController } from './follow-up.controller';
 import { FollowUpProcessor } from './follow-up.processor';
+import { Church } from '../churches/church.entity';
+import { MessagingModule } from '../messaging/messaging.module';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([FollowUpJourney, FollowUpTask, Member, User, Visit, WorkerCodeDispatchLog]),
+    TypeOrmModule.forFeature([FollowUpJourney, FollowUpTask, Member, User, Visit, WorkerCodeDispatchLog, Church]),
+    MessagingModule,
     BullModule.registerQueue({ name: 'follow-up' }),
   ],
   controllers: [FollowUpController],

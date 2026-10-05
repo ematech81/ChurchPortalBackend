@@ -38,6 +38,10 @@ export class User extends BaseEntity {
   @Column({ type: 'timestamp', nullable: true })
   otpExpiresAt: Date | null;
 
+  // Wrong-code guesses against the current OTP; the OTP is destroyed at the limit.
+  @Column({ type: 'int', default: 0 })
+  otpAttempts: number;
+
   @Column({ default: true })
   isActive: boolean;
 

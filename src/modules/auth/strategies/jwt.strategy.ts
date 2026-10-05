@@ -6,25 +6,37 @@ import { UsersService } from '../../users/users.service';
 
 interface JwtPayload {
   sub: string;
-  churchId: string | null;
-  role: string;
+  typ?: string;
 }
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor(
-    private readonly config: ConfigService,
+    config: ConfigService,
     private readonly usersService: UsersService,
   ) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       secretOrKey: config.get<string>('app.jwtSecret'),
+      ignoreExpiration: false,
     });
   }
 
   async validate(payload: JwtPayload) {
+    // A refresh token must never work as an access token (even if both secrets match).
+    if (payload.typ === 'refresh') throw new UnauthorizedException();
+
     const user = await this.usersService.findById(payload.sub);
-    if (!user) throw new UnauthorizedException();
-    return { id: user.id, churchId: payload.churchId, role: payload.role };
+    if (!user || !user.isActive) throw new UnauthorizedException();
+
+    // Role and church come from the database, not the token, so demotions,
+    // branch reassignments and deactivations take effect immediately.
+    return {
+      id: user.id,
+      churchId: user.churchId,
+      role: user.role,
+      firstName: user.firstName,
+      lastName: user.lastName,
+    };
   }
 }

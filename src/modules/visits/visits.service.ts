@@ -1,7 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, MoreThanOrEqual } from 'typeorm';
 import { Visit, VisitStatus } from './visit.entity';
+import { CreateVisitDto, UpdateVisitDto } from './dto/visit.dto';
 
 @Injectable()
 export class VisitsService {
@@ -9,8 +10,20 @@ export class VisitsService {
     @InjectRepository(Visit) private readonly repo: Repository<Visit>,
   ) {}
 
-  create(churchId: string, workerId: string, data: Partial<Visit>) {
-    return this.repo.save(this.repo.create({ ...data, churchId, workerId }));
+  create(churchId: string, workerId: string, dto: CreateVisitDto) {
+    return this.repo.save(
+      this.repo.create({
+        churchId,
+        workerId,
+        title: dto.title.trim(),
+        scheduledAt: new Date(dto.scheduledAt),
+        memberId: dto.memberId ?? null,
+        address: dto.address ?? null,
+        latitude: dto.latitude ?? null,
+        longitude: dto.longitude ?? null,
+        context: dto.context ?? null,
+      }),
+    );
   }
 
   getForWorker(workerId: string, churchId: string) {
@@ -33,7 +46,17 @@ export class VisitsService {
     });
   }
 
-  update(id: string, churchId: string, data: Partial<Visit>) {
-    return this.repo.update({ id, churchId }, data as any);
+  /** `onlyWorkerId`: when set, the visit must belong to that worker (non-admin callers). */
+  async update(id: string, churchId: string, dto: UpdateVisitDto, onlyWorkerId: string | null) {
+    const visit = await this.repo.findOne({
+      where: { id, churchId, ...(onlyWorkerId ? { workerId: onlyWorkerId } : {}) },
+    });
+    if (!visit) throw new NotFoundException('Visit not found');
+    const { scheduledAt, ...rest } = dto;
+    await this.repo.update(
+      { id, churchId },
+      { ...rest, ...(scheduledAt ? { scheduledAt: new Date(scheduledAt) } : {}) } as any,
+    );
+    return this.repo.findOne({ where: { id, churchId } });
   }
 }

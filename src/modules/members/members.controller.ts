@@ -1,66 +1,62 @@
 import {
   Controller, Get, Post, Patch, Delete,
-  Param, Body, Query, UseGuards, HttpCode, HttpStatus,
-  UseInterceptors, UploadedFile, Req, BadRequestException, ForbiddenException,
+  Param, Body, Query, ParseUUIDPipe, HttpCode, HttpStatus,
+  UseInterceptors, UploadedFile, Req, BadRequestException,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { diskStorage } from 'multer';
 import { ApiTags, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
-import { join } from 'path';
-import { mkdirSync } from 'fs';
 import { MembersService } from './members.service';
-import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
-import { RolesGuard } from '../../common/guards/roles.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { ChurchId } from '../../common/decorators/church-id.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { UserRole } from '@/types';
+import { imageUploadOptions, publicUploadUrl } from '../../common/utils/image-upload';
+import { MEMBER_WRITE_ROLES, STAFF_ROLES, SENIOR_ROLES } from '../../constants/role-groups';
 
 @ApiTags('Members')
 @ApiBearerAuth()
-@UseGuards(JwtAuthGuard)
 @Controller('members')
 export class MembersController {
   constructor(private readonly membersService: MembersService) {}
 
   @Post('photo')
-  @UseInterceptors(FileInterceptor('photo', {
-    storage: diskStorage({
-      destination: (_req: any, _file: any, cb: any) => {
-        const dir = join(process.cwd(), 'uploads', 'members');
-        mkdirSync(dir, { recursive: true });
-        cb(null, dir);
-      },
-      filename: (_req: any, file: any, cb: any) => {
-        const ext = (file.originalname.split('.').pop() ?? 'jpg').toLowerCase();
-        cb(null, `${Date.now()}.${ext}`);
-      },
-    }),
-    limits: { fileSize: 5 * 1024 * 1024 },
-  }))
+  @Roles(...MEMBER_WRITE_ROLES)
+  @UseInterceptors(FileInterceptor('photo', imageUploadOptions('members')))
   async uploadPhoto(@UploadedFile() file: any, @Req() req: any) {
     if (!file) throw new BadRequestException('No file provided');
-    const url = `${req.protocol}://${req.get('host')}/uploads/members/${file.filename}`;
-    return { url };
+    return { url: publicUploadUrl(req, 'members', file.filename) };
   }
 
   @Get()
+  @Roles(...STAFF_ROLES)
   @ApiQuery({ name: 'search', required: false })
   @ApiQuery({ name: 'status', required: false })
   @ApiQuery({ name: 'limit', required: false })
-  findAll(
+  @ApiQuery({ name: 'scope', required: false, description: "'all' = whole organisation (Senior Pastor only)" })
+  async findAll(
     @ChurchId() churchId: string,
+    @CurrentUser() user: { role: string },
     @Query('search') search?: string,
     @Query('status') status?: string,
     @Query('limit') limit?: string,
+    @Query('scope') scope?: string,
   ) {
-    return this.membersService.findAll(churchId, search, status, limit ? parseInt(limit, 10) : 100);
+    const s = await this.membersService.resolveScope(churchId, user.role, scope === 'all');
+    return this.membersService.findAll(s, search, status, limit ? parseInt(limit, 10) : undefined);
   }
 
   @Get('count')
+  @Roles(...STAFF_ROLES)
   @ApiQuery({ name: 'status', required: false })
-  count(@ChurchId() churchId: string, @Query('status') status?: string) {
-    return this.membersService.count(churchId, status);
+  @ApiQuery({ name: 'scope', required: false })
+  async count(
+    @ChurchId() churchId: string,
+    @CurrentUser() user: { role: string },
+    @Query('status') status?: string,
+    @Query('scope') scope?: string,
+  ) {
+    const s = await this.membersService.resolveScope(churchId, user.role, scope === 'all');
+    return this.membersService.count(s, status);
   }
 
   /**
@@ -69,6 +65,7 @@ export class MembersController {
    * Safe to call multiple times.
    */
   @Post('sync-pastoral')
+  @Roles(...SENIOR_ROLES)
   syncPastoral(@ChurchId() churchId: string) {
     return this.membersService.syncPastoralRecords(churchId);
   }
@@ -79,6 +76,7 @@ export class MembersController {
    * pastor_registration. Pass ?dryRun=false to apply the fix.
    */
   @Post('cleanup-mislabeled')
+  @Roles(...SENIOR_ROLES)
   @ApiQuery({ name: 'dryRun', required: false })
   cleanupMislabeled(
     @ChurchId() churchId: string,
@@ -88,33 +86,48 @@ export class MembersController {
   }
 
   @Get(':id')
-  findOne(@Param('id') id: string, @ChurchId() churchId: string) {
-    return this.membersService.findByIdOrFail(id, churchId);
+  @Roles(...STAFF_ROLES)
+  async findOne(
+    @Param('id', ParseUUIDPipe) id: string,
+    @ChurchId() churchId: string,
+    @CurrentUser() user: { role: string },
+  ) {
+    // A Senior Pastor may open any member of their organisation, e.g. one in a branch.
+    const s = await this.membersService.resolveScope(churchId, user.role, true);
+    return this.membersService.findByIdOrFail(id, s);
   }
 
   @Post()
-  create(@ChurchId() churchId: string, @Body() body: Record<string, unknown>) {
-    return this.membersService.create(churchId, body as any);
+  @Roles(...MEMBER_WRITE_ROLES)
+  create(
+    @ChurchId() churchId: string,
+    @CurrentUser() user: { id: string },
+    @Body() body: Record<string, unknown>,
+  ) {
+    return this.membersService.create(churchId, body, user.id);
   }
 
   @Patch(':id')
-  update(
-    @Param('id') id: string,
+  @Roles(...MEMBER_WRITE_ROLES)
+  async update(
+    @Param('id', ParseUUIDPipe) id: string,
     @ChurchId() churchId: string,
+    @CurrentUser() user: { id: string; role: string },
     @Body() body: Record<string, unknown>,
   ) {
-    return this.membersService.update(id, churchId, body as any);
+    const s = await this.membersService.resolveScope(churchId, user.role, true);
+    return this.membersService.update(id, s, body, user.id);
   }
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  @UseGuards(RolesGuard)
   @Roles(UserRole.SENIOR_PASTOR, UserRole.BRANCH_PASTOR)
-  remove(
-    @Param('id') id: string,
+  async remove(
+    @Param('id', ParseUUIDPipe) id: string,
     @ChurchId() churchId: string,
     @CurrentUser() caller: { id: string; role: string },
   ) {
-    return this.membersService.softDelete(id, churchId, { userId: caller.id, role: caller.role });
+    const s = await this.membersService.resolveScope(churchId, caller.role, true);
+    return this.membersService.softDelete(id, s, { userId: caller.id, role: caller.role });
   }
 }

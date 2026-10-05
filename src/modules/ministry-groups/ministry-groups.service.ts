@@ -1,11 +1,13 @@
 import { Injectable, OnModuleInit, NotFoundException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, IsNull, Or } from 'typeorm';
+import { Repository, IsNull, In } from 'typeorm';
 import { GroupCategory } from './group-category.entity';
 import { MinistryGroup, GroupStatus } from './ministry-group.entity';
 import { MinistryGroupMember } from './ministry-group-member.entity';
 import { MinistryGroupAttendance } from './ministry-group-attendance.entity';
 import { Member } from '../members/member.entity';
+import { Church } from '../churches/church.entity';
+import { CreateCategoryDto, CreateGroupDto, UpdateGroupDto } from './dto/ministry-group.dto';
 
 // ── Default seed categories ───────────────────────────────────────────────────
 // These are global (churchId = null) and created once on first boot.
@@ -59,7 +61,41 @@ export class MinistryGroupsService implements OnModuleInit {
     private readonly attendanceRepo: Repository<MinistryGroupAttendance>,
     @InjectRepository(Member)
     private readonly memberRepo: Repository<Member>,
+    @InjectRepository(Church)
+    private readonly churchRepo: Repository<Church>,
   ) {}
+
+  // ── Tenant guards ─────────────────────────────────────────────────────────
+
+  private async _assertGroup(groupId: string, churchId: string): Promise<MinistryGroup> {
+    const group = await this.groupRepo.findOne({ where: { id: groupId, churchId } });
+    if (!group) throw new NotFoundException('Ministry group not found');
+    return group;
+  }
+
+  private async _assertMembers(memberIds: string[], churchId: string) {
+    const unique = [...new Set(memberIds)];
+    if (!unique.length) return;
+    const found = await this.memberRepo.count({ where: { id: In(unique), churchId } });
+    if (found !== unique.length) throw new BadRequestException('One or more members were not found.');
+  }
+
+  /** Categories are global (churchId NULL) or this church's own. */
+  private async _assertCategory(categoryId: string, churchId: string) {
+    const ok = await this.categoryRepo
+      .createQueryBuilder('c')
+      .where('c.id = :categoryId AND (c.churchId IS NULL OR c.churchId = :churchId)', { categoryId, churchId })
+      .getExists();
+    if (!ok) throw new BadRequestException('Category not found.');
+  }
+
+  /** A group's branch must be this church or one of its direct branches. */
+  private async _assertBranch(branchId: string, churchId: string) {
+    const ok =
+      branchId === churchId ||
+      (await this.churchRepo.exist({ where: { id: branchId, parentChurchId: churchId } }));
+    if (!ok) throw new BadRequestException('Branch not found.');
+  }
 
   // ── Seed default categories on first boot ─────────────────────────────────
   async onModuleInit() {
@@ -88,7 +124,7 @@ export class MinistryGroupsService implements OnModuleInit {
       .getMany();
   }
 
-  createCategory(churchId: string, data: Partial<GroupCategory>) {
+  createCategory(churchId: string, data: CreateCategoryDto) {
     const maxOrder = this.categoryRepo
       .createQueryBuilder('c')
       .select('MAX(c.sortOrder)', 'max')
@@ -98,7 +134,15 @@ export class MinistryGroupsService implements OnModuleInit {
 
     return maxOrder.then((order) =>
       this.categoryRepo.save(
-        this.categoryRepo.create({ ...data, churchId, sortOrder: order }),
+        this.categoryRepo.create({
+          name: data.name.trim(),
+          description: data.description ?? null,
+          iconKey: data.iconKey ?? null,
+          defaultLeaderTitle: data.defaultLeaderTitle,
+          defaultMemberTitle: data.defaultMemberTitle,
+          churchId,
+          sortOrder: order,
+        }),
       ),
     );
   }
@@ -119,6 +163,9 @@ export class MinistryGroupsService implements OnModuleInit {
       qb.andWhere('g.categoryId = :categoryId', { categoryId });
     }
     if (status) {
+      if (!Object.values(GroupStatus).includes(status as GroupStatus)) {
+        throw new BadRequestException('Unknown status filter.');
+      }
       qb.andWhere('g.status = :status', { status });
     }
 
@@ -141,7 +188,7 @@ export class MinistryGroupsService implements OnModuleInit {
     // Load leaders
     const leaderIds = [...new Set(groups.map((g) => g.leaderId).filter(Boolean))] as string[];
     const leaders = leaderIds.length
-      ? await this.memberRepo.findByIds(leaderIds)
+      ? await this.memberRepo.findBy({ id: In(leaderIds), churchId })
       : [];
     const leaderMap = new Map(leaders.map((l) => [l.id, l]));
 
@@ -185,7 +232,7 @@ export class MinistryGroupsService implements OnModuleInit {
 
     // Load member details for memberships
     const memberIds = memberships.map((m) => m.memberId);
-    const members = memberIds.length ? await this.memberRepo.findByIds(memberIds) : [];
+    const members = memberIds.length ? await this.memberRepo.findBy({ id: In(memberIds), churchId }) : [];
     const memberMap = new Map(members.map((m) => [m.id, m]));
 
     const enrichedMemberships = memberships.map((m) => ({
@@ -195,24 +242,25 @@ export class MinistryGroupsService implements OnModuleInit {
 
     // Leader info
     const leader = group.leaderId
-      ? await this.memberRepo.findOne({ where: { id: group.leaderId } })
+      ? await this.memberRepo.findOne({ where: { id: group.leaderId, churchId } })
       : null;
 
     // Growth metric: members joined this quarter vs last quarter
     const now = new Date();
     const qStart = new Date(now.getFullYear(), Math.floor(now.getMonth() / 3) * 3, 1);
-    const prevQStart = new Date(qStart);
-    prevQStart.setMonth(prevQStart.getMonth() - 3);
 
-    const [thisQ, prevQ] = await Promise.all([
-      this.membershipRepo.count({ where: { groupId: id } }),
-      this.membershipRepo
-        .createQueryBuilder('m')
-        .where('m.groupId = :id AND m.joinedAt < :qStart', { id, qStart })
-        .getCount(),
-    ]);
+    // Growth = change in ACTIVE members between the start of this quarter and now.
+    const activeNow = memberships.length;
+    const activeAtQuarterStart = await this.membershipRepo
+      .createQueryBuilder('m')
+      .where('m.groupId = :id AND m.joinedAt < :qStart', { id, qStart })
+      .andWhere('(m.leftAt IS NULL OR m.leftAt >= :qStart)', { qStart })
+      .getCount();
 
-    const growthPct = prevQ > 0 ? Math.round(((thisQ - prevQ) / prevQ) * 100) : null;
+    const growthPct =
+      activeAtQuarterStart > 0
+        ? Math.round(((activeNow - activeAtQuarterStart) / activeAtQuarterStart) * 100)
+        : null;
 
     return {
       ...group,
@@ -224,24 +272,17 @@ export class MinistryGroupsService implements OnModuleInit {
     };
   }
 
-  async createGroup(churchId: string, data: {
-    categoryId: string;
-    name: string;
-    description?: string;
-    leaderId?: string;
-    leaderRoleTitle?: string;
-    branchId?: string;
-    cadence?: string;
-    meetingDay?: string;
-    meetingTime?: string;
-    status?: GroupStatus;
-    coverImageUrl?: string;
-    isDraft?: boolean;
-    initialMemberIds?: { memberId: string; roleTitle?: string }[];
-  }) {
+  async createGroup(churchId: string, data: CreateGroupDto) {
+    await this._assertCategory(data.categoryId, churchId);
+    if (data.leaderId) await this._assertMembers([data.leaderId], churchId);
+    if (data.branchId) await this._assertBranch(data.branchId, churchId);
+    if (data.initialMemberIds?.length) {
+      await this._assertMembers(data.initialMemberIds.map((m) => m.memberId), churchId);
+    }
+
     // Duplicate name check within same category
     const duplicate = await this.groupRepo.findOne({
-      where: { churchId, categoryId: data.categoryId, name: data.name },
+      where: { churchId, categoryId: data.categoryId, name: data.name.trim() },
     });
     if (duplicate && !data.isDraft) {
       throw new BadRequestException(
@@ -253,7 +294,7 @@ export class MinistryGroupsService implements OnModuleInit {
       this.groupRepo.create({
         churchId,
         categoryId: data.categoryId,
-        name: data.name,
+        name: data.name.trim(),
         description: data.description ?? null,
         leaderId: data.leaderId ?? null,
         leaderRoleTitle: data.leaderRoleTitle ?? null,
@@ -268,7 +309,8 @@ export class MinistryGroupsService implements OnModuleInit {
     );
 
     if (data.initialMemberIds?.length) {
-      const memberships = data.initialMemberIds.map((m) =>
+      const unique = new Map(data.initialMemberIds.map((m) => [m.memberId, m]));
+      const memberships = [...unique.values()].map((m) =>
         this.membershipRepo.create({
           churchId,
           groupId: group.id,
@@ -282,11 +324,17 @@ export class MinistryGroupsService implements OnModuleInit {
     return group;
   }
 
-  async updateGroup(id: string, churchId: string, data: Partial<MinistryGroup>) {
-    const group = await this.groupRepo.findOne({ where: { id, churchId } });
-    if (!group) throw new NotFoundException('Ministry group not found');
-    await this.groupRepo.update({ id, churchId }, data as any);
-    return this.groupRepo.findOne({ where: { id } });
+  async updateGroup(id: string, churchId: string, data: UpdateGroupDto) {
+    await this._assertGroup(id, churchId);
+    if (data.categoryId) await this._assertCategory(data.categoryId, churchId);
+    if (data.leaderId) await this._assertMembers([data.leaderId], churchId);
+    if (data.branchId) await this._assertBranch(data.branchId, churchId);
+
+    // Members are managed through the membership endpoints, never through a group update.
+    const { initialMemberIds, ...fields } = data;
+    void initialMemberIds;
+    if (Object.keys(fields).length) await this.groupRepo.update({ id, churchId }, fields as any);
+    return this.groupRepo.findOne({ where: { id, churchId } });
   }
 
   async deleteGroup(id: string, churchId: string) {
@@ -298,12 +346,13 @@ export class MinistryGroupsService implements OnModuleInit {
   // ── Memberships ───────────────────────────────────────────────────────────
 
   async addMember(groupId: string, churchId: string, memberId: string, roleTitle = 'Member') {
-    const existing = await this.membershipRepo.findOne({
-      where: { groupId, memberId, leftAt: undefined as any },
+    await this._assertGroup(groupId, churchId);
+    await this._assertMembers([memberId], churchId);
+
+    const active = await this.membershipRepo.findOne({
+      where: { groupId, memberId, churchId, leftAt: IsNull() },
     });
-    if (existing && !existing.leftAt) {
-      throw new BadRequestException('Member is already in this group.');
-    }
+    if (active) throw new BadRequestException('Member is already in this group.');
 
     return this.membershipRepo.save(
       this.membershipRepo.create({ churchId, groupId, memberId, roleTitle }),
@@ -312,22 +361,28 @@ export class MinistryGroupsService implements OnModuleInit {
 
   async removeMember(groupId: string, memberId: string, churchId: string) {
     const membership = await this.membershipRepo.findOne({
-      where: { groupId, memberId },
+      where: { groupId, memberId, churchId, leftAt: IsNull() },
     });
     if (!membership) throw new NotFoundException('Membership not found');
-    await this.membershipRepo.update(membership.id, { leftAt: new Date() } as any);
+    await this.membershipRepo.update(membership.id, { leftAt: new Date() });
   }
 
   // ── Attendance ────────────────────────────────────────────────────────────
 
   async recordAttendance(groupId: string, churchId: string, date: string, presentCount: number, totalCount: number) {
-    const existing = await this.attendanceRepo.findOne({ where: { groupId, date } });
+    await this._assertGroup(groupId, churchId);
+    if (presentCount > totalCount) {
+      throw new BadRequestException('Present count cannot exceed the total.');
+    }
+    const day = date.slice(0, 10); // the column is a plain DATE
+
+    const existing = await this.attendanceRepo.findOne({ where: { groupId, churchId, date: day } });
     if (existing) {
-      await this.attendanceRepo.update(existing.id, { presentCount, totalCount } as any);
-      return this.attendanceRepo.findOne({ where: { groupId, date } });
+      await this.attendanceRepo.update(existing.id, { presentCount, totalCount });
+      return this.attendanceRepo.findOne({ where: { id: existing.id } });
     }
     return this.attendanceRepo.save(
-      this.attendanceRepo.create({ churchId, groupId, date, presentCount, totalCount }),
+      this.attendanceRepo.create({ churchId, groupId, date: day, presentCount, totalCount }),
     );
   }
 }

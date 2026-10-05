@@ -1,9 +1,10 @@
-import { Injectable, NotFoundException, ConflictException } from '@nestjs/common';
+import { Injectable, NotFoundException, ConflictException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, In } from 'typeorm';
 import { AttendanceRecord } from './attendance-record.entity';
 import { ServiceEvent } from './service-event.entity';
 import { Member } from '../members/member.entity';
+import { CreateEventDto } from './dto/attendance.dto';
 
 @Injectable()
 export class AttendanceService {
@@ -18,8 +19,16 @@ export class AttendanceService {
 
   // ── Service Events ─────────────────────────────────────────────────────────
 
-  createEvent(churchId: string, data: Partial<ServiceEvent>) {
-    return this.eventRepo.save(this.eventRepo.create({ ...data, churchId }));
+  createEvent(churchId: string, dto: CreateEventDto) {
+    return this.eventRepo.save(
+      this.eventRepo.create({
+        churchId,
+        title: dto.title.trim(),
+        type: dto.type,
+        date: new Date(dto.date),
+        notes: dto.notes ?? null,
+      }),
+    );
   }
 
   async getEvents(churchId: string) {
@@ -49,13 +58,16 @@ export class AttendanceService {
 
   async deleteEvent(churchId: string, eventId: string) {
     const event = await this.getEventById(churchId, eventId);
-    await this.recordRepo.delete({ churchId, serviceEventId: event.id });
-    await this.eventRepo.remove(event);
+    // Soft delete: the event disappears from lists but its attendance history is kept.
+    await this.eventRepo.softRemove(event);
   }
 
   // ── Attendance Records ──────────────────────────────────────────────────────
 
   async checkIn(churchId: string, serviceEventId: string, memberId: string, checkedInBy: string) {
+    await this.getEventById(churchId, serviceEventId);
+    const isOurs = await this.memberRepo.exist({ where: { id: memberId, churchId } });
+    if (!isOurs) throw new BadRequestException('Member not found.');
     const existing = await this.recordRepo.findOne({ where: { churchId, serviceEventId, memberId } });
     if (existing) throw new ConflictException('Member is already checked in for this service');
     return this.recordRepo.save(
@@ -64,6 +76,7 @@ export class AttendanceService {
   }
 
   async checkInVisitor(churchId: string, serviceEventId: string, visitorName: string, checkedInBy: string) {
+    await this.getEventById(churchId, serviceEventId);
     return this.recordRepo.save(
       this.recordRepo.create({ churchId, serviceEventId, visitorName, checkedInAt: new Date(), checkedInBy }),
     );
@@ -82,7 +95,7 @@ export class AttendanceService {
     });
 
     const memberIds = records.map((r) => r.memberId).filter(Boolean) as string[];
-    const members = memberIds.length ? await this.memberRepo.findByIds(memberIds) : [];
+    const members = memberIds.length ? await this.memberRepo.findBy({ id: In(memberIds), churchId }) : [];
     const memberMap = new Map(members.map((m) => [m.id, m]));
 
     return records.map((r) => ({
@@ -167,7 +180,7 @@ export class AttendanceService {
 
       absentRegularsTotal = absentIds.length;
       if (absentIds.length > 0) {
-        absentRegulars = await this.memberRepo.findByIds(absentIds.slice(0, 20));
+        absentRegulars = await this.memberRepo.findBy({ id: In(absentIds.slice(0, 20)), churchId });
       }
     }
 

@@ -5,6 +5,7 @@ import { MinistryGroup } from './ministry-group.entity';
 import { MinistryGroupMember } from './ministry-group-member.entity';
 import { MinistryGroupAttendance } from './ministry-group-attendance.entity';
 import { Member } from '../members/member.entity';
+import { Church } from '../churches/church.entity';
 import { MinistryGroupsService } from './ministry-groups.service';
 import { MinistryGroupsController } from './ministry-groups.controller';
 
@@ -16,6 +17,7 @@ import { MinistryGroupsController } from './ministry-groups.controller';
       MinistryGroupMember,
       MinistryGroupAttendance,
       Member,
+      Church,
     ]),
   ],
   controllers: [MinistryGroupsController],
