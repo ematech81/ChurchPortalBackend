@@ -176,12 +176,18 @@ describe('C4 — pastor OTP login', () => {
     const start = await api(app).post('/auth/login-pastor').send({ phone: '+2348035557777' }).expect(200);
     expect(start.body.delivery).toBe('dev');
     const code = start.body.devCode as string;
+    // SMS-style codes are alphanumeric (carriers block all-numeric OTPs on the promotional route)
+    expect(code).toMatch(/^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{6}$/);
+    expect(code).toMatch(/[A-Z]/);
+    expect(code).toMatch(/[2-9]/);
     const stored = await ds.query(`SELECT "otpCode" FROM users WHERE phone = $1`, ['0803 555 7777']);
     expect(stored[0].otpCode).not.toBe(code); // not stored in plaintext
 
-    const ok = await api(app).post('/auth/verify-pastor-otp').send({ phone: '08035557777', code }).expect(200);
+    // people type lowercase from an SMS — it must still work
+    const ok = await api(app).post('/auth/verify-pastor-otp').send({ phone: '08035557777', code: code.toLowerCase() }).expect(200);
     expect(ok.body.user.role).toBe('branch_pastor');
     await api(app).post('/auth/verify-pastor-otp').send({ phone: '08035557777', code }).expect(400); // used up
+    await api(app).post('/auth/verify-pastor-otp').send({ phone: '08035557777', code: '12345' }).expect(400); // wrong length
   });
 
   it('locks the code after 5 wrong guesses (even if the 6th is right)', async () => {

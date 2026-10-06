@@ -13,7 +13,7 @@ import { MessagingModule } from '../messaging/messaging.module';
   imports: [
     UsersModule,
     MailModule,
-    MessagingModule, // TermiiProvider, for pastor login codes by SMS
+    MessagingModule, // BulkSmsProvider, for pastor login codes by SMS
     PassportModule,
     JwtModule.registerAsync({
       inject: [ConfigService],

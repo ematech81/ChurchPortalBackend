@@ -91,19 +91,19 @@ describe('Bulk messaging', () => {
     const m2 = await mk('Two', { smsOptIn: false });
     const foreign = (await api(app, other).post('/members').send({ firstName: 'F', lastName: 'F', phone: '08090000000' }).expect(201)).body;
 
-    const res = await api(app, sp).post('/messaging/send-bulk').send({ memberIds: [m1.id, m2.id, foreign.id], channel: 'sms', body: 'Hello' }).expect(201);
-    // Termii isn't configured in tests, so the one eligible send fails — but the call itself succeeds.
+    const res = await api(app, sp).post('/messaging/send-bulk').send({ memberIds: [m1.id, m2.id, foreign.id], body: 'Hello' }).expect(201);
+    // BulkSMS isn't configured in tests, so the one eligible send fails — but the call itself succeeds.
     expect(res.body).toEqual({ requested: 3, sent: 0, failed: 1, skipped: 2 });
 
     // fresh IPs: the bulk endpoint deliberately allows only ~1 call per second per client
     const fresh = () => api(app, { accessToken: sp.accessToken, ip: nextIp() });
-    await fresh().post('/messaging/send-bulk').send({ memberIds: [], channel: 'sms', body: 'x' }).expect(400);
-    await fresh().post('/messaging/send-bulk').send({ memberIds: [m1.id], channel: 'telegram', body: 'x' }).expect(400);
+    await fresh().post('/messaging/send-bulk').send({ memberIds: [], body: 'x' }).expect(400);
+    await fresh().post('/messaging/send-bulk').send({ memberIds: [m1.id], body: '' }).expect(400);
 
     // a plain member of the church cannot send at all
     const plain = await signUp(app);
     await ds.query(`UPDATE users SET "churchId" = $1, role = 'member' WHERE id = $2`, [sp.churchId, plain.user.id]);
-    await api(app, plain).post('/messaging/send-bulk').send({ memberIds: [m1.id], channel: 'sms', body: 'x' }).expect(403);
+    await api(app, plain).post('/messaging/send-bulk').send({ memberIds: [m1.id], body: 'x' }).expect(403);
   });
 });
 

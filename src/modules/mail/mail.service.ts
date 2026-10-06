@@ -13,7 +13,8 @@ export class MailService {
   }
 
   async sendOtp(email: string, code: string): Promise<void> {
-    const apiKey = this.config.get<string>('app.brevoApiKey');
+    // Hard stop: automated tests must never send real email.
+    const apiKey = process.env.NODE_ENV === 'test' ? undefined : this.config.get<string>('app.brevoApiKey');
 
     if (!apiKey) {
       // Only ever print the code for local development — production logs are not a safe place for OTPs.

@@ -1,4 +1,4 @@
-import { ArrayMaxSize, ArrayMinSize, ArrayUnique, IsArray, IsIn, IsOptional, IsString, IsUUID, Matches, MaxLength, MinLength } from 'class-validator';
+import { ArrayMaxSize, ArrayMinSize, ArrayUnique, IsArray, IsOptional, IsString, IsUUID, Matches, MaxLength, MinLength } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 export class SendMessageDto {
@@ -27,10 +27,6 @@ export class SendBulkDto {
   @ArrayUnique()
   @IsUUID('all', { each: true })
   memberIds: string[];
-
-  @ApiProperty({ enum: ['sms', 'whatsapp'] })
-  @IsIn(['sms', 'whatsapp'])
-  channel: 'sms' | 'whatsapp';
 
   @ApiProperty()
   @IsString()

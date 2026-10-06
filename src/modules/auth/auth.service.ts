@@ -14,7 +14,7 @@ import * as bcrypt from 'bcryptjs';
 import { createHash, createHmac, randomInt, randomUUID, timingSafeEqual } from 'crypto';
 import { UsersService } from '../users/users.service';
 import { MailService } from '../mail/mail.service';
-import { TermiiProvider } from '../messaging/providers/termii.provider';
+import { BulkSmsProvider } from '../messaging/providers/bulksms.provider';
 import { User } from '../users/user.entity';
 import { UserRole } from '@/types';
 import { toE164 } from '../../common/utils/phone';
@@ -29,6 +29,22 @@ import { VerifyPhoneOtpDto } from './dto/phone.dto';
 const OTP_TTL_MS = 10 * 60 * 1000;
 const OTP_RESEND_COOLDOWN_MS = 60 * 1000;
 const MAX_OTP_ATTEMPTS = 5;
+
+/**
+ * SMS login codes are alphanumeric on purpose. BulkSMS Nigeria sends over the promotional route,
+ * which carriers monitor; all-numeric "OTP-looking" messages get flagged and blocked there (they
+ * require a separately licensed transactional route). A mix of letters and digits gets through.
+ * No 0/O/1/I/L so codes can be read off a phone without mistakes.
+ */
+const SMS_OTP_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+
+export function generateAlphanumericOtp(): string {
+  for (;;) {
+    let otp = '';
+    for (let i = 0; i < 6; i++) otp += SMS_OTP_CHARS[randomInt(SMS_OTP_CHARS.length)];
+    if (/[A-Z]/.test(otp) && /[0-9]/.test(otp)) return otp; // must contain both
+  }
+}
 
 /** Emails we generate for accounts that have no real mailbox. Never deliver to these. */
 const isPlaceholderEmail = (e?: string | null) => !e || e.endsWith('@portal.internal');
@@ -50,7 +66,7 @@ export class AuthService {
   constructor(
     private readonly usersService: UsersService,
     private readonly mailService: MailService,
-    private readonly sms: TermiiProvider,
+    private readonly sms: BulkSmsProvider,
     private readonly jwtService: JwtService,
     private readonly config: ConfigService,
   ) {}
@@ -395,7 +411,7 @@ export class AuthService {
     if (Date.now() > user.otpExpiresAt.getTime()) {
       throw new BadRequestException('Verification code has expired. Please request a new one.');
     }
-    if (!safeEqualHex(this._otpHash(code), user.otpCode)) {
+    if (!safeEqualHex(this._otpHash(code.trim().toUpperCase()), user.otpCode)) {
       const attempts = await this.usersService.incrementOtpAttempts(user.id);
       if (attempts >= MAX_OTP_ATTEMPTS) {
         await this.usersService.clearOtp(user.id);
@@ -440,42 +456,46 @@ export class AuthService {
   }
 
   /**
-   * Delivers a pastor login code: SMS (Termii) if configured, else the email on
+   * Delivers a pastor login code: SMS (BulkSMS Nigeria) if configured, else the email on
    * file, else — local development only — returned in the response.
    * In production with no channel configured we refuse rather than pretend.
+   * SMS (and dev) codes are alphanumeric; email codes stay numeric.
    */
   private async _sendPastorOtp(
     user: User,
     phone: string,
   ): Promise<{ delivery: 'sms' | 'email' | 'dev'; devCode?: string }> {
-    const code = this._newOtp();
+    const smsReady = this.sms.isConfigured;
+    const emailReady = !isPlaceholderEmail(user.email) && !!this.config.get('app.brevoApiKey');
+    const devReady = !!this.config.get<boolean>('app.allowDevOtp');
+
+    if (!smsReady && !emailReady && !devReady) {
+      this.logger.error('Pastor OTP requested but neither SMS (BULKSMS_*) nor email (BREVO_API_KEY) is configured.');
+      throw new ServiceUnavailableException('Code delivery is not available. Please contact support.');
+    }
+
+    const code = smsReady || (!emailReady && devReady) ? generateAlphanumericOtp() : this._newOtp();
     await this.usersService.setOtp(user.id, this._otpHash(code), new Date(Date.now() + OTP_TTL_MS));
 
     try {
-      if (this.sms.isConfigured) {
+      if (smsReady) {
         await this.sms.sendSms(
           toE164(phone),
-          `Your Kingdom Portal code is ${code}. It expires in 10 minutes. Never share it.`,
+          this.config.get<string>('app.smsOtpTemplate')!.replace('{code}', code),
         );
         return { delivery: 'sms' };
       }
-      if (!isPlaceholderEmail(user.email) && this.config.get('app.brevoApiKey')) {
+      if (emailReady) {
         await this.mailService.sendOtp(user.email, code);
         return { delivery: 'email' };
       }
-      if (this.config.get<boolean>('app.allowDevOtp')) {
-        this.logger.warn(`[DEV] Branch Pastor OTP for ${phone}: ${code}`);
-        return { delivery: 'dev', devCode: code };
-      }
+      this.logger.warn(`[DEV] Branch Pastor OTP for ${phone}: ${code}`);
+      return { delivery: 'dev', devCode: code };
     } catch (err: any) {
       await this.usersService.clearOtp(user.id);
       this.logger.error(`Pastor OTP delivery failed for user ${user.id}: ${err?.message ?? err}`);
       throw new ServiceUnavailableException('We could not send your code right now. Please try again shortly.');
     }
-
-    await this.usersService.clearOtp(user.id);
-    this.logger.error('Pastor OTP requested but neither SMS (TERMII_*) nor email (BREVO_API_KEY) is configured.');
-    throw new ServiceUnavailableException('Code delivery is not available. Please contact support.');
   }
 
   private async _dispatchOtp(userId: string, email: string) {

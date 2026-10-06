@@ -26,17 +26,11 @@ export class MessagingController {
     return this.messagingService.getLogs(churchId);
   }
 
-  @Post('whatsapp')
-  @Throttle(SEND_LIMITS)
-  sendWhatsApp(@ChurchId() churchId: string, @Body() dto: SendMessageDto) {
-    return this.messagingService.sendWhatsApp(churchId, dto.to, dto.message, dto.memberId);
-  }
-
-  /** Sends one message to many members (max 100 per call), skipping anyone who opted out. */
+  /** Sends one SMS to many members (max 100 per call), skipping anyone who opted out. */
   @Post('send-bulk')
   @Throttle({ short: { limit: 1, ttl: 1000 }, medium: { limit: 5, ttl: 60_000 }, long: { limit: 30, ttl: 60 * 60_000 } })
   sendBulk(@ChurchId() churchId: string, @Body() dto: SendBulkDto) {
-    return this.messagingService.sendBulk(churchId, dto.memberIds, dto.channel, dto.body);
+    return this.messagingService.sendBulk(churchId, dto.memberIds, dto.body);
   }
 
   @Post('sms')

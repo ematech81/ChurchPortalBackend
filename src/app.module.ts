@@ -16,7 +16,6 @@ import { FollowUpModule } from './modules/follow-up/follow-up.module';
 import { GivingModule } from './modules/giving/giving.module';
 import { MessagingModule } from './modules/messaging/messaging.module';
 import { CellsModule } from './modules/cells/cells.module';
-import { BillingModule } from './modules/billing/billing.module';
 import { MailModule } from './modules/mail/mail.module';
 import { ServiceEventsModule } from './modules/service-events/service-events.module';
 import { FamiliesModule } from './modules/families/families.module';
@@ -35,7 +34,8 @@ import { RolesGuard } from './common/guards/roles.guard';
     ConfigModule.forRoot({
       isGlobal: true,
       load: [appConfig, databaseConfig, redisConfig],
-      envFilePath: ['.env.local', '.env'],
+      // Tests must be hermetic: never read a developer's real .env (it holds live SMS/email keys).
+      envFilePath: process.env.NODE_ENV === 'test' ? [] : ['.env.local', '.env'],
     }),
 
     TypeOrmModule.forRootAsync({
@@ -91,7 +91,6 @@ import { RolesGuard } from './common/guards/roles.guard';
     GivingModule,
     MessagingModule,
     CellsModule,
-    BillingModule,
     MaintenanceModule,
     VisitsModule,
     MinistryGroupsModule,

@@ -5,7 +5,7 @@ import { MessageLog } from './message-log.entity';
 import { Member } from '../members/member.entity';
 import { MessagingService } from './messaging.service';
 import { MessagingController } from './messaging.controller';
-import { TermiiProvider } from './providers/termii.provider';
+import { BulkSmsProvider } from './providers/bulksms.provider';
 
 @Module({
   imports: [
@@ -13,7 +13,7 @@ import { TermiiProvider } from './providers/termii.provider';
     BullModule.registerQueue({ name: 'messaging' }),
   ],
   controllers: [MessagingController],
-  providers: [MessagingService, TermiiProvider],
-  exports: [MessagingService, TermiiProvider],
+  providers: [MessagingService, BulkSmsProvider],
+  exports: [MessagingService, BulkSmsProvider],
 })
 export class MessagingModule {}

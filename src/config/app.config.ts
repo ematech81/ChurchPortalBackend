@@ -23,11 +23,15 @@ export default registerAs('app', () => {
     jwtRefreshSecret,
     jwtRefreshExpiresIn: process.env.JWT_REFRESH_EXPIRES_IN ?? '30d',
     brevoApiKey: process.env.BREVO_API_KEY,
-    mailFrom: process.env.MAIL_FROM ?? 'Kingdom Portal <noreply@kingdomportal.app>',
+    // Brevo silently drops mail from unverified senders, so the default is the verified one.
+    mailFrom: process.env.MAIL_FROM ?? 'Kingdom Portal <nwankwolivinus95@gmail.com>',
     // Only honoured when NODE_ENV !== 'production'. Lets local dev see OTPs in API responses.
     allowDevOtp: process.env.ALLOW_DEV_OTP === 'true' && process.env.NODE_ENV !== 'production',
-    termiiBaseUrl: process.env.TERMII_BASE_URL ?? 'https://api.ng.termii.com/api',
-    termiiApiKey: process.env.TERMII_API_KEY,
-    termiiSenderId: process.env.TERMII_SENDER_ID,
+    smsProvider: process.env.SMS_PROVIDER ?? 'bulksms',
+    bulksmsBaseUrl: (process.env.BULKSMS_BASE_URL ?? 'https://www.bulksmsnigeria.com/api/v2').replace(/\/+$/, ''),
+    bulksmsApiToken: process.env.BULKSMS_API_TOKEN,
+    bulksmsSenderId: process.env.BULKSMS_SENDER_ID,
+    // Wording matters: the promotional route rejects text that reads like an OTP (BSNG-2013). {code} is replaced.
+    smsOtpTemplate: process.env.SMS_OTP_TEMPLATE ?? 'Kingdom Portal sign-in: {code}. Valid for 10 minutes.',
   };
 });

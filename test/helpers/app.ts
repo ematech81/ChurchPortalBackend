@@ -17,9 +17,9 @@ process.env.DB_SYNCHRONIZE = 'false';
 process.env.DB_RUN_MIGRATIONS = 'true';
 process.env.ALLOW_DEV_OTP = 'true';
 process.env.BCRYPT_ROUNDS = '4';
-delete process.env.BREVO_API_KEY;
-delete process.env.TERMII_API_KEY;
-delete process.env.TERMII_SENDER_ID;
+process.env.BREVO_API_KEY = '';
+process.env.BULKSMS_API_TOKEN = '';
+process.env.BULKSMS_SENDER_ID = '';
 
 import { AppModule } from '../../src/app.module';
 import { MailService } from '../../src/modules/mail/mail.service';
