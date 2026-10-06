@@ -54,3 +54,8 @@ export class RecordGroupAttendanceDto {
   @ApiProperty() @IsInt() @Min(0) @Max(100000) presentCount: number;
   @ApiProperty() @IsInt() @Min(0) @Max(100000) totalCount: number;
 }
+
+export class AddToWorkforceDto {
+  @ApiProperty() @IsUUID() memberId: string;
+  @ApiProperty({ required: false, example: 'Volunteer' }) @IsOptional() @IsString() @MaxLength(60) roleTitle?: string;
+}

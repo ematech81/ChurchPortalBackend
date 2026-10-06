@@ -22,6 +22,9 @@ const WRITABLE_FIELDS = [
   'decisionType', 'invitedBy', 'latitude', 'longitude', 'customFields',
 ] as const;
 
+/** Tag that puts a member in the follow-up queue (see FollowUpService.getFollowUpQueue). */
+export const FOLLOW_UP_TAG = 'Follow-Up Needed';
+
 const STATUS_FILTERS = new Set<string>([...Object.values(MemberStatus), 'all', 'pastoral']);
 
 /** Escape LIKE wildcards so a search for "100%" or "a_b" is literal. */
@@ -184,6 +187,41 @@ export class MembersService {
     }
     await this.repo.update({ id, churchId }, { ...data, updatedById: userId } as any);
     return this.findByIdOrFail(id, churchId);
+  }
+
+  // ── follow-up flag ───────────────────────────────────────────────────────────
+  // Puts an existing member (e.g. one who is backsliding) into — or takes them out of — the
+  // follow-up queue. Pastors and ministers are never flagged: they are the shepherds.
+  async setFollowUpFlag(id: string, scope: Scope, flag: boolean, reason: string | undefined, userId: string) {
+    const member = await this.findByIdOrFail(id, scope);
+
+    const isShepherd =
+      member.status === MemberStatus.PASTOR ||
+      member.status === MemberStatus.MINISTER ||
+      (member.churchRole && PASTOR_CHURCH_ROLES.includes(member.churchRole as string));
+    if (isShepherd) {
+      throw new BadRequestException('Pastors and ministers cannot be flagged for follow-up.');
+    }
+
+    const tags = new Set(member.tags ?? []);
+    const customFields = { ...(member.customFields ?? {}) } as Record<string, unknown>;
+    if (flag) {
+      tags.add(FOLLOW_UP_TAG);
+      customFields.followUp = {
+        reason: reason?.trim() || null,
+        flaggedAt: new Date().toISOString(),
+        flaggedBy: userId,
+      };
+    } else {
+      tags.delete(FOLLOW_UP_TAG);
+      delete customFields.followUp;
+    }
+
+    await this.repo.update(
+      { id, churchId: member.churchId },
+      { tags: [...tags], customFields, updatedById: userId } as any,
+    );
+    return this.findByIdOrFail(id, member.churchId);
   }
 
   // ── syncPastoralRecords ───────────────────────────────────────────────────────

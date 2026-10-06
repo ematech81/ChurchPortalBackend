@@ -59,6 +59,7 @@ export class MessagingService {
     let sent = 0;
     let failed = 0;
     let skipped = memberIds.length - members.length; // unknown / other-church ids
+    let firstError: string | null = null;
 
     for (const m of members) {
       if (!m.phone || m.smsOptIn === false) {
@@ -68,10 +69,12 @@ export class MessagingService {
       try {
         await this.sendSms(churchId, m.phone, body, m.id);
         sent++;
-      } catch {
+      } catch (e: any) {
         failed++;
+        firstError ??= e?.message ?? 'Unknown error';
       }
     }
-    return { requested: memberIds.length, sent, failed, skipped };
+    // firstError is the gateway's own reason (e.g. insufficient balance) so admins can act on it.
+    return { requested: memberIds.length, sent, failed, skipped, firstError };
   }
 }

@@ -5,9 +5,10 @@ import {
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { MinistryGroupsService } from './ministry-groups.service';
 import {
-  CreateCategoryDto, CreateGroupDto, UpdateGroupDto, AddGroupMemberDto, RecordGroupAttendanceDto,
+  CreateCategoryDto, CreateGroupDto, UpdateGroupDto, AddGroupMemberDto, RecordGroupAttendanceDto, AddToWorkforceDto,
 } from './dto/ministry-group.dto';
 import { ChurchId } from '../../common/decorators/church-id.decorator';
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { ADMIN_ROLES, STAFF_ROLES } from '../../constants/role-groups';
 
@@ -87,6 +88,20 @@ export class MinistryGroupsController {
     @Body() dto: AddGroupMemberDto,
   ) {
     return this.svc.addMember(groupId, churchId, dto.memberId, dto.roleTitle);
+  }
+
+  /**
+   * "Add to workforce": puts a member into a department/group AND makes them a worker
+   * (status → worker) if they were an ordinary member. Pastors and ministers keep their status.
+   */
+  @Post('ministry-groups/:id/workforce')
+  addToWorkforce(
+    @Param('id', ParseUUIDPipe) groupId: string,
+    @ChurchId() churchId: string,
+    @CurrentUser() user: { id: string },
+    @Body() dto: AddToWorkforceDto,
+  ) {
+    return this.svc.addToWorkforce(groupId, churchId, dto.memberId, dto.roleTitle, user.id);
   }
 
   @Delete('ministry-groups/:id/members/:memberId')

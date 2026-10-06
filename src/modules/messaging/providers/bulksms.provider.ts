@@ -60,7 +60,11 @@ export class BulkSmsProvider {
         ? `${err.response.data.code ?? ''} ${err.response.data.error?.message ?? err.response.data.message ?? ''}`.trim()
         : err?.message;
       this.logger.error(`BulkSMS send failed: ${reason}`);
-      throw new ServiceUnavailableException('Could not send the message right now.');
+      // The reason (e.g. "Insufficient balance", "Sender ID not approved") is safe to show to church
+      // admins and is exactly what they need to fix the problem. It never contains credentials.
+      throw new ServiceUnavailableException(
+        reason ? `SMS gateway: ${reason}`.slice(0, 200) : 'Could not send the message right now.',
+      );
     }
   }
 }

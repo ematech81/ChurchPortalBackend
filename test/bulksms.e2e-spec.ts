@@ -42,12 +42,12 @@ describe('BulkSmsProvider', () => {
 
   it('treats a 200 response with status "error" as a failure', async () => {
     post.mockResolvedValue({ data: { status: 'error', code: 'BSNG-2012', error: { message: 'Duplicate message' } } });
-    await expect(new BulkSmsProvider(cfg()).sendSms('08031112222', 'x')).rejects.toThrow('Could not send');
+    await expect(new BulkSmsProvider(cfg()).sendSms('08031112222', 'x')).rejects.toThrow('SMS gateway');
   });
 
   it('turns HTTP failures into a clean error without leaking the token', async () => {
     post.mockRejectedValue({ response: { data: { code: 'BSNG-1001', error: { message: 'Invalid token' } } } });
-    await expect(new BulkSmsProvider(cfg()).sendSms('08031112222', 'x')).rejects.toThrow('Could not send');
+    await expect(new BulkSmsProvider(cfg()).sendSms('08031112222', 'x')).rejects.toThrow('Invalid token');
   });
 
   it('is unconfigured without a token/sender or with another provider selected', async () => {

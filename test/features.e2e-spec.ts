@@ -93,7 +93,8 @@ describe('Bulk messaging', () => {
 
     const res = await api(app, sp).post('/messaging/send-bulk').send({ memberIds: [m1.id, m2.id, foreign.id], body: 'Hello' }).expect(201);
     // BulkSMS isn't configured in tests, so the one eligible send fails — but the call itself succeeds.
-    expect(res.body).toEqual({ requested: 3, sent: 0, failed: 1, skipped: 2 });
+    expect(res.body).toMatchObject({ requested: 3, sent: 0, failed: 1, skipped: 2 });
+    expect(res.body.firstError).toContain('not configured');
 
     // fresh IPs: the bulk endpoint deliberately allows only ~1 call per second per client
     const fresh = () => api(app, { accessToken: sp.accessToken, ip: nextIp() });

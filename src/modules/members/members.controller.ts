@@ -10,6 +10,7 @@ import { Roles } from '../../common/decorators/roles.decorator';
 import { ChurchId } from '../../common/decorators/church-id.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { UserRole } from '@/types';
+import { FollowUpFlagDto } from './dto/follow-up-flag.dto';
 import { imageUploadOptions, publicUploadUrl } from '../../common/utils/image-upload';
 import { MEMBER_WRITE_ROLES, STAFF_ROLES, SENIOR_ROLES } from '../../constants/role-groups';
 
@@ -117,6 +118,19 @@ export class MembersController {
   ) {
     const s = await this.membersService.resolveScope(churchId, user.role, true);
     return this.membersService.update(id, s, body, user.id);
+  }
+
+  /** Flag (or un-flag) an existing member for follow-up, e.g. someone who is backsliding. */
+  @Post(':id/follow-up-flag')
+  @Roles(...MEMBER_WRITE_ROLES)
+  async setFollowUpFlag(
+    @Param('id', ParseUUIDPipe) id: string,
+    @ChurchId() churchId: string,
+    @CurrentUser() user: { id: string; role: string },
+    @Body() dto: FollowUpFlagDto,
+  ) {
+    const s = await this.membersService.resolveScope(churchId, user.role, true);
+    return this.membersService.setFollowUpFlag(id, s, dto.flag, dto.reason, user.id);
   }
 
   @Delete(':id')

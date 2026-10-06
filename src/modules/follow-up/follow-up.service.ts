@@ -487,6 +487,18 @@ export class FollowUpService {
     const update: Partial<FollowUpJourney> = { status };
     if (status === JourneyStatus.COMPLETED) update.completedAt = new Date();
     await this.journeyRepo.update({ id: journeyId, churchId }, update as any);
+
+    if (status === JourneyStatus.COMPLETED) {
+      // Graduation: take them out of the queue for good, otherwise a flagged member (or a
+      // new convert) would pop straight back into "Pending follow-ups".
+      const m = await this.memberRepo.findOne({ where: { id: journey.memberId, churchId } });
+      if (m) {
+        const tags = (m.tags ?? []).filter((t) => t !== 'Follow-Up Needed');
+        const patch: Partial<Member> = { tags };
+        if (m.status === MemberStatus.NEW_CONVERT) patch.status = MemberStatus.MEMBER;
+        await this.memberRepo.update({ id: m.id, churchId }, patch as any);
+      }
+    }
     return this.journeyRepo.findOne({ where: { id: journeyId, churchId } });
   }
 

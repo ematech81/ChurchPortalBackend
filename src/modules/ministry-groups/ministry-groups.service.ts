@@ -6,6 +6,7 @@ import { MinistryGroup, GroupStatus } from './ministry-group.entity';
 import { MinistryGroupMember } from './ministry-group-member.entity';
 import { MinistryGroupAttendance } from './ministry-group-attendance.entity';
 import { Member } from '../members/member.entity';
+import { MemberStatus } from '@/types';
 import { Church } from '../churches/church.entity';
 import { CreateCategoryDto, CreateGroupDto, UpdateGroupDto } from './dto/ministry-group.dto';
 
@@ -357,6 +358,39 @@ export class MinistryGroupsService implements OnModuleInit {
     return this.membershipRepo.save(
       this.membershipRepo.create({ churchId, groupId, memberId, roleTitle }),
     );
+  }
+
+  /** Statuses that become 'worker' when someone joins the workforce. Pastors/ministers/etc. are left alone. */
+  private static readonly PROMOTABLE_TO_WORKER: string[] = [
+    MemberStatus.MEMBER, MemberStatus.FIRST_TIMER, MemberStatus.NEW_CONVERT,
+    MemberStatus.VISITOR, MemberStatus.BACKSLIDDEN,
+  ];
+
+  async addToWorkforce(groupId: string, churchId: string, memberId: string, roleTitle: string | undefined, userId: string) {
+    const group = await this._assertGroup(groupId, churchId);
+    const member = await this.memberRepo.findOne({ where: { id: memberId, churchId } });
+    if (!member) throw new NotFoundException('Member not found');
+
+    const already = await this.membershipRepo.findOne({ where: { groupId, memberId, churchId, leftAt: IsNull() } });
+    if (already) throw new BadRequestException(`${member.firstName} is already in ${group.name}.`);
+
+    return this.groupRepo.manager.transaction(async (tx) => {
+      const membership = await tx.save(
+        tx.create(MinistryGroupMember, { churchId, groupId, memberId, roleTitle: roleTitle?.trim() || 'Member' }),
+      );
+
+      const update: Partial<Member> = { updatedById: userId };
+      if (MinistryGroupsService.PROMOTABLE_TO_WORKER.includes(member.status)) update.status = MemberStatus.WORKER;
+      if (!member.departmentName) {
+        update.departmentName = group.name;
+        update.departmentRole = roleTitle?.trim() || null;
+        update.departmentJoinedDate = new Date();
+      }
+      await tx.update(Member, { id: memberId, churchId }, update as any);
+
+      const fresh = await tx.findOneByOrFail(Member, { id: memberId, churchId });
+      return { membership, member: fresh, group: { id: group.id, name: group.name } };
+    });
   }
 
   async removeMember(groupId: string, memberId: string, churchId: string) {
