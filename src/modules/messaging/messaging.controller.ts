@@ -4,6 +4,7 @@ import { Throttle } from '@nestjs/throttler';
 import { MessagingService } from './messaging.service';
 import { SendMessageDto, SendBulkDto } from './dto/send-message.dto';
 import { ChurchId } from '../../common/decorators/church-id.decorator';
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { ADMIN_ROLES } from '../../constants/role-groups';
 
@@ -26,11 +27,11 @@ export class MessagingController {
     return this.messagingService.getLogs(churchId);
   }
 
-  /** Sends one SMS to many members (max 100 per call), skipping anyone who opted out. */
+  /** Sends one SMS to many members (explicit ids, or an audience), skipping anyone who opted out. */
   @Post('send-bulk')
   @Throttle({ short: { limit: 1, ttl: 1000 }, medium: { limit: 5, ttl: 60_000 }, long: { limit: 30, ttl: 60 * 60_000 } })
-  sendBulk(@ChurchId() churchId: string, @Body() dto: SendBulkDto) {
-    return this.messagingService.sendBulk(churchId, dto.memberIds, dto.body);
+  sendBulk(@ChurchId() churchId: string, @CurrentUser() user: { role: string }, @Body() dto: SendBulkDto) {
+    return this.messagingService.sendBulk(churchId, user.role, dto);
   }
 
   @Post('sms')

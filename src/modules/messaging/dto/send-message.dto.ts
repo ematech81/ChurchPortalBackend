@@ -1,4 +1,4 @@
-import { ArrayMaxSize, ArrayMinSize, ArrayUnique, IsArray, IsOptional, IsString, IsUUID, Matches, MaxLength, MinLength } from 'class-validator';
+import { ArrayMaxSize, ArrayMinSize, ArrayUnique, IsArray, IsBoolean, IsOptional, IsString, IsUUID, Matches, MaxLength, MinLength } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 export class SendMessageDto {
@@ -20,13 +20,30 @@ export class SendMessageDto {
 }
 
 export class SendBulkDto {
-  @ApiProperty({ type: [String] })
+  @ApiProperty({ type: [String], required: false, description: 'Explicit recipients. Omit to use the audience fields.' })
+  @IsOptional()
   @IsArray()
   @ArrayMinSize(1)
-  @ArrayMaxSize(100)
+  @ArrayMaxSize(2000)
   @ArrayUnique()
   @IsUUID('all', { each: true })
-  memberIds: string[];
+  memberIds?: string[];
+
+  @ApiProperty({ required: false, description: "Audience: a member status such as 'worker', or 'all'" })
+  @IsOptional()
+  @IsString()
+  @MaxLength(30)
+  status?: string;
+
+  @ApiProperty({ required: false, description: 'Audience: only youth' })
+  @IsOptional()
+  @IsBoolean()
+  youthOnly?: boolean;
+
+  @ApiProperty({ required: false, description: 'Senior Pastor only: include every branch' })
+  @IsOptional()
+  @IsBoolean()
+  wholeOrg?: boolean;
 
   @ApiProperty()
   @IsString()

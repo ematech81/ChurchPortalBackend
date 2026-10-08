@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { BullModule } from '@nestjs/bullmq';
 import { MessageLog } from './message-log.entity';
+import { Church } from '../churches/church.entity';
 import { Member } from '../members/member.entity';
 import { MessagingService } from './messaging.service';
 import { MessagingController } from './messaging.controller';
@@ -9,7 +10,7 @@ import { BulkSmsProvider } from './providers/bulksms.provider';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([MessageLog, Member]),
+    TypeOrmModule.forFeature([MessageLog, Member, Church]),
     BullModule.registerQueue({ name: 'messaging' }),
   ],
   controllers: [MessagingController],
