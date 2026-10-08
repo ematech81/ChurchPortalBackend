@@ -27,6 +27,8 @@ export default registerAs('app', () => {
     mailFrom: process.env.MAIL_FROM ?? 'Kingdom Portal <nwankwolivinus95@gmail.com>',
     // Only honoured when NODE_ENV !== 'production'. Lets local dev see OTPs in API responses.
     allowDevOtp: process.env.ALLOW_DEV_OTP === 'true' && process.env.NODE_ENV !== 'production',
+    // Where the public web app is hosted (no trailing slash). Event registration links are built from it.
+    publicWebUrl: (process.env.PUBLIC_WEB_URL ?? '').replace(/\/+$/, ''),
     smsProvider: process.env.SMS_PROVIDER ?? 'bulksms',
     bulksmsBaseUrl: (process.env.BULKSMS_BASE_URL ?? 'https://www.bulksmsnigeria.com/api/v2').replace(/\/+$/, ''),
     bulksmsApiToken: process.env.BULKSMS_API_TOKEN,

@@ -23,6 +23,7 @@ import { DashboardModule } from './modules/dashboard/dashboard.module';
 import { MaintenanceModule } from './modules/maintenance/maintenance.module';
 import { VisitsModule } from './modules/visits/visits.module';
 import { MinistryGroupsModule } from './modules/ministry-groups/ministry-groups.module';
+import { EventRegistrationModule } from './modules/event-registration/event-registration.module';
 import appConfig from './config/app.config';
 import databaseConfig from './config/database.config';
 import redisConfig, { parseRedisUrl } from './config/redis.config';
@@ -94,6 +95,7 @@ import { RolesGuard } from './common/guards/roles.guard';
     MaintenanceModule,
     VisitsModule,
     MinistryGroupsModule,
+    EventRegistrationModule,
   ],
   controllers: [AppController],
   providers: [

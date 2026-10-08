@@ -11,6 +11,9 @@ import { ChurchId } from '../../common/decorators/church-id.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { UserRole } from '@/types';
 import { FollowUpFlagDto } from './dto/follow-up-flag.dto';
+import { MemberExportDto, MemberExportCountDto } from './dto/member-export.dto';
+import { MembersExportService } from './members-export.service';
+import { ADMIN_ROLES } from '../../constants/role-groups';
 import { imageUploadOptions, publicUploadUrl } from '../../common/utils/image-upload';
 import { MEMBER_WRITE_ROLES, STAFF_ROLES, SENIOR_ROLES } from '../../constants/role-groups';
 
@@ -18,7 +21,25 @@ import { MEMBER_WRITE_ROLES, STAFF_ROLES, SENIOR_ROLES } from '../../constants/r
 @ApiBearerAuth()
 @Controller('members')
 export class MembersController {
-  constructor(private readonly membersService: MembersService) {}
+  constructor(
+    private readonly membersService: MembersService,
+    private readonly exportService: MembersExportService,
+  ) {}
+
+  // ── Export (pastors only; every export is written to the audit log) ──────────
+
+  /** How many people would this export contain? */
+  @Post('export/count')
+  @Roles(...ADMIN_ROLES)
+  exportCount(@ChurchId() churchId: string, @CurrentUser() user: { role: string }, @Body() dto: MemberExportCountDto) {
+    return this.exportService.count(churchId, user.role, dto);
+  }
+
+  @Post('export')
+  @Roles(...ADMIN_ROLES)
+  export(@ChurchId() churchId: string, @CurrentUser() user: { id: string; role: string }, @Body() dto: MemberExportDto) {
+    return this.exportService.export(churchId, user.role, user.id, dto);
+  }
 
   @Post('photo')
   @Roles(...MEMBER_WRITE_ROLES)
