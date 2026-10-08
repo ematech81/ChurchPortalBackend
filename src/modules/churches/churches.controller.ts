@@ -13,7 +13,7 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ChurchId } from '../../common/decorators/church-id.decorator';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { ADMIN_ROLES, SENIOR_ROLES } from '../../constants/role-groups';
-import { imageUploadOptions, publicUploadUrl } from '../../common/utils/image-upload';
+import { imageUploadOptions, saveImage } from '../../common/utils/image-upload';
 
 // Authentication is enforced globally (JwtAuthGuard); authorization is declared per route.
 @ApiTags('Churches')
@@ -45,10 +45,10 @@ export class ChurchesController {
   /** Uploads the church logo and stores its URL on the caller's church. */
   @Post('me/logo')
   @Roles(...ADMIN_ROLES)
-  @UseInterceptors(FileInterceptor('logo', imageUploadOptions('logos')))
+  @UseInterceptors(FileInterceptor('logo', imageUploadOptions()))
   async uploadLogo(@ChurchId() churchId: string, @UploadedFile() file: any, @Req() req: any) {
     if (!file) throw new BadRequestException('No file provided');
-    const logoUrl = publicUploadUrl(req, 'logos', file.filename);
+    const logoUrl = await saveImage(req, 'logos', file);
     await this.churchesService.update(churchId, { logoUrl });
     return { logoUrl };
   }

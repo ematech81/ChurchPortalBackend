@@ -134,5 +134,7 @@ describe('Church logo upload', () => {
     expect(me.logoUrl).toBe(ok.body.logoUrl);
 
     await api(app, sp).post('/churches/me/logo').attach('logo', Buffer.from('<script>alert(1)</script>'), { filename: 'x.html', contentType: 'text/html' }).expect(400);
+    // an HTML file dressed up as a PNG is rejected by its contents, not its label
+    await api(app, sp).post('/churches/me/logo').attach('logo', Buffer.from('<script>alert(1)</script>'), { filename: 'x.png', contentType: 'image/png' }).expect(400);
   });
 });

@@ -15,7 +15,7 @@ import { YouthBulkDto } from './dto/youth-bulk.dto';
 import { MemberExportDto, MemberExportCountDto } from './dto/member-export.dto';
 import { MembersExportService } from './members-export.service';
 import { ADMIN_ROLES } from '../../constants/role-groups';
-import { imageUploadOptions, publicUploadUrl } from '../../common/utils/image-upload';
+import { imageUploadOptions, saveImage } from '../../common/utils/image-upload';
 import { MEMBER_WRITE_ROLES, STAFF_ROLES, SENIOR_ROLES } from '../../constants/role-groups';
 
 @ApiTags('Members')
@@ -44,10 +44,10 @@ export class MembersController {
 
   @Post('photo')
   @Roles(...MEMBER_WRITE_ROLES)
-  @UseInterceptors(FileInterceptor('photo', imageUploadOptions('members')))
+  @UseInterceptors(FileInterceptor('photo', imageUploadOptions()))
   async uploadPhoto(@UploadedFile() file: any, @Req() req: any) {
     if (!file) throw new BadRequestException('No file provided');
-    return { url: publicUploadUrl(req, 'members', file.filename) };
+    return { url: await saveImage(req, 'members', file) };
   }
 
   @Get()
