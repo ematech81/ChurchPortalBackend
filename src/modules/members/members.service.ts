@@ -19,7 +19,7 @@ const WRITABLE_FIELDS = [
   'pastoralPosition', 'customRole', 'departmentName', 'departmentRole', 'departmentJoinedDate',
   'parentGuardianName', 'parentGuardianPhone', 'ageRange', 'pickupAuthorization', 'familyId',
   'householdId', 'householdRole', 'cellGroupId', 'tags', 'whatsappOptIn', 'smsOptIn',
-  'decisionType', 'invitedBy', 'latitude', 'longitude', 'customFields',
+  'decisionType', 'invitedBy', 'isYouth', 'latitude', 'longitude', 'customFields',
 ] as const;
 
 /** Tag that puts a member in the follow-up queue (see FollowUpService.getFollowUpQueue). */
@@ -82,7 +82,7 @@ export class MembersService {
   }
 
   // ── findAll ───────────────────────────────────────────────────────────────────
-  async findAll(scope: Scope, search?: string, status?: string, limit?: number) {
+  async findAll(scope: Scope, search?: string, status?: string, limit?: number, youth = false) {
     if (status && !STATUS_FILTERS.has(status)) throw new BadRequestException('Unknown status filter.');
     const take = Math.min(Number.isFinite(limit) && limit! > 0 ? limit! : 100, 500);
     const s = search?.trim() ? escapeLike(search.trim()) : undefined;
@@ -92,12 +92,14 @@ export class MembersService {
 
     if (status === 'pastor' || status === 'pastoral') {
       const qb = this.pastorQb(scope).orderBy('m.firstName', 'ASC').take(take);
+      if (youth) qb.andWhere('m.isYouth = true');
       if (searchClause) qb.andWhere(searchClause, { s: `%${s}%` });
       return qb.getMany();
     }
 
     if (status === 'minister') {
       const qb = this.ministerQb(scope).orderBy('m.firstName', 'ASC').take(take);
+      if (youth) qb.andWhere('m.isYouth = true');
       if (searchClause) qb.andWhere(searchClause, { s: `%${s}%` });
       return qb.getMany();
     }
@@ -105,7 +107,7 @@ export class MembersService {
     const statusFilter = status && status !== 'all' ? (status as MemberStatus) : undefined;
 
     if (s) {
-      const base = { churchId: In(ids(scope)), ...(statusFilter ? { status: statusFilter } : {}) };
+      const base = { churchId: In(ids(scope)), ...(statusFilter ? { status: statusFilter } : {}), ...(youth ? { isYouth: true } : {}) };
       return this.repo.find({
         where: [
           { ...base, firstName: ILike(`%${s}%`) },
@@ -120,19 +122,27 @@ export class MembersService {
     }
 
     return this.repo.find({
-      where: { churchId: In(ids(scope)), ...(statusFilter ? { status: statusFilter } : {}) },
+      where: { churchId: In(ids(scope)), ...(statusFilter ? { status: statusFilter } : {}), ...(youth ? { isYouth: true } : {}) },
       order: { firstName: 'ASC' },
       take,
     });
   }
 
   // ── count ─────────────────────────────────────────────────────────────────────
-  async count(scope: Scope, status?: string) {
+  async count(scope: Scope, status?: string, youth = false) {
     if (status && !STATUS_FILTERS.has(status)) throw new BadRequestException('Unknown status filter.');
-    if (status === 'pastor' || status === 'pastoral') return this.pastorQb(scope).getCount();
-    if (status === 'minister') return this.ministerQb(scope).getCount();
+    if (status === 'pastor' || status === 'pastoral') {
+      const qb = this.pastorQb(scope);
+      if (youth) qb.andWhere('m.isYouth = true');
+      return qb.getCount();
+    }
+    if (status === 'minister') {
+      const qb = this.ministerQb(scope);
+      if (youth) qb.andWhere('m.isYouth = true');
+      return qb.getCount();
+    }
     const statusFilter = status && status !== 'all' ? (status as MemberStatus) : undefined;
-    return this.repo.count({ where: { churchId: In(ids(scope)), ...(statusFilter ? { status: statusFilter } : {}) } });
+    return this.repo.count({ where: { churchId: In(ids(scope)), ...(statusFilter ? { status: statusFilter } : {}), ...(youth ? { isYouth: true } : {}) } });
   }
 
   // ── countPastors (dashboard stat) ────────────────────────────────────────────
@@ -187,6 +197,60 @@ export class MembersService {
     }
     await this.repo.update({ id, churchId }, { ...data, updatedById: userId } as any);
     return this.findByIdOrFail(id, churchId);
+  }
+
+  // ── youth ─────────────────────────────────────────────────────────────────────
+  /** Numbers for the Youth page: totals, gender split, newcomers, flagged, birthdays (month + day only). */
+  async youthSummary(scope: Scope) {
+    const where = { churchId: In(ids(scope)), isYouth: true };
+    const [total, male, female, flagged, newThisMonth, withoutPhoneOptIn] = await Promise.all([
+      this.repo.count({ where }),
+      this.repo.count({ where: { ...where, gender: 'male' as any } }),
+      this.repo.count({ where: { ...where, gender: 'female' as any } }),
+      this.repo
+        .createQueryBuilder('m')
+        .where('m.churchId IN (:...ids) AND m.isYouth = true AND :tag = ANY(m.tags)', { ids: ids(scope), tag: FOLLOW_UP_TAG })
+        .getCount(),
+      this.repo
+        .createQueryBuilder('m')
+        .where("m.churchId IN (:...ids) AND m.isYouth = true AND m.createdAt >= date_trunc('month', now())", { ids: ids(scope) })
+        .getCount(),
+      this.repo.count({ where: { ...where, smsOptIn: false } }),
+    ]);
+
+    // Birthdays use only month + day (people often leave the year out). The next 30 days, wrapping year-end.
+    const birthdays = await this.repo
+      .createQueryBuilder('m')
+      .select(['m.id', 'm.firstName', 'm.lastName', 'm.phone', 'm.dateOfBirth', 'm.churchId'])
+      .where('m.churchId IN (:...ids) AND m.isYouth = true AND m.dateOfBirth IS NOT NULL', { ids: ids(scope) })
+      .getMany();
+
+    const today = new Date();
+    const todayMid = Date.UTC(today.getFullYear(), today.getMonth(), today.getDate());
+    const upcoming = birthdays
+      .map((m) => {
+        const d = new Date(m.dateOfBirth as Date);
+        const month = d.getMonth();
+        const day = d.getDate();
+        let next = Date.UTC(today.getFullYear(), month, day);
+        if (next < todayMid) next = Date.UTC(today.getFullYear() + 1, month, day);
+        return { id: m.id, firstName: m.firstName, lastName: m.lastName, phone: m.phone, month: month + 1, day, inDays: Math.round((next - todayMid) / 86400000) };
+      })
+      .filter((b) => b.inDays <= 30)
+      .sort((a, b) => a.inDays - b.inDays);
+
+    return { total, male, female, flagged, newThisMonth, smsOptedOut: withoutPhoneOptIn, upcomingBirthdays: upcoming };
+  }
+
+  /** Mark (or unmark) many existing members as youth in one go. Tenant-scoped; returns how many changed. */
+  async setYouthBulk(scope: Scope, memberIds: string[], isYouth: boolean, userId: string) {
+    const res = await this.repo
+      .createQueryBuilder()
+      .update(Member)
+      .set({ isYouth, updatedById: userId } as any)
+      .where('id IN (:...memberIds) AND "churchId" IN (:...churchIds)', { memberIds, churchIds: ids(scope) })
+      .execute();
+    return { updated: res.affected ?? 0 };
   }
 
   // ── follow-up flag ───────────────────────────────────────────────────────────

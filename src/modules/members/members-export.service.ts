@@ -73,6 +73,7 @@ export class MembersExportService {
     }
 
     if (f.flaggedOnly) qb.andWhere(':tag = ANY(m.tags)', { tag: 'Follow-Up Needed' });
+    if (f.youthOnly) qb.andWhere('m.isYouth = true');
 
     if (f.groupId) {
       qb.andWhere(
@@ -150,6 +151,7 @@ export class MembersExportService {
         detail: dto.detail,
         statuses: dto.statuses ?? ['all'],
         flaggedOnly: !!dto.flaggedOnly,
+        youthOnly: !!dto.youthOnly,
         groupId: dto.groupId ?? null,
         branchId: dto.branchId ?? null,
         skippedInvalidPhone: skipped,

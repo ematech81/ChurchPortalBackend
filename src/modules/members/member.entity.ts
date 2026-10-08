@@ -9,6 +9,7 @@ import {
 @Index(['churchId', 'phone'])
 @Index(['churchId', 'email'])
 @Index(['churchId', 'memberId'])
+@Index(['churchId', 'isYouth'])
 export class Member extends TenantEntity {
   // ── Auto-generated membership ID ─────────────────────────────────────────
   @Column({ type: 'varchar', nullable: true })
@@ -140,6 +141,12 @@ export class Member extends TenantEntity {
 
   @Column({ type: 'text', array: true, default: [] })
   tags: string[];
+
+  // ── Youth ─────────────────────────────────────────────────────────────────
+  // Set explicitly by the registrar: many people give day + month but no birth year, so the youth
+  // roll cannot be derived from age.
+  @Column({ default: false })
+  isYouth: boolean;
 
   // ── Communication Preferences ─────────────────────────────────────────────
   @Column({ default: true })

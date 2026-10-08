@@ -17,6 +17,11 @@ export class MemberExportDto {
   @IsBoolean()
   flaggedOnly?: boolean;
 
+  @ApiProperty({ required: false, description: 'Only members marked as youth' })
+  @IsOptional()
+  @IsBoolean()
+  youthOnly?: boolean;
+
   @ApiProperty({ required: false, description: 'Only members of this department/group' })
   @IsOptional()
   @IsUUID()
@@ -45,6 +50,7 @@ export class MemberExportDto {
 export class MemberExportCountDto {
   @IsOptional() @IsArray() @ArrayMaxSize(20) @IsIn(EXPORT_STATUSES, { each: true }) statuses?: string[];
   @IsOptional() @IsBoolean() flaggedOnly?: boolean;
+  @IsOptional() @IsBoolean() youthOnly?: boolean;
   @IsOptional() @IsUUID() groupId?: string;
   @IsOptional() @IsString() @ValidateIf((o) => o.branchId !== 'all') @IsUUID() branchId?: string;
 }

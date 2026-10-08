@@ -11,6 +11,7 @@ import { ChurchId } from '../../common/decorators/church-id.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { UserRole } from '@/types';
 import { FollowUpFlagDto } from './dto/follow-up-flag.dto';
+import { YouthBulkDto } from './dto/youth-bulk.dto';
 import { MemberExportDto, MemberExportCountDto } from './dto/member-export.dto';
 import { MembersExportService } from './members-export.service';
 import { ADMIN_ROLES } from '../../constants/role-groups';
@@ -62,9 +63,34 @@ export class MembersController {
     @Query('status') status?: string,
     @Query('limit') limit?: string,
     @Query('scope') scope?: string,
+    @Query('youth') youth?: string,
   ) {
     const s = await this.membersService.resolveScope(churchId, user.role, scope === 'all');
-    return this.membersService.findAll(s, search, status, limit ? parseInt(limit, 10) : undefined);
+    return this.membersService.findAll(s, search, status, limit ? parseInt(limit, 10) : undefined, youth === 'true');
+  }
+
+  @Get('youth/summary')
+  @Roles(...STAFF_ROLES)
+  @ApiQuery({ name: 'scope', required: false })
+  async youthSummary(
+    @ChurchId() churchId: string,
+    @CurrentUser() user: { role: string },
+    @Query('scope') scope?: string,
+  ) {
+    const s = await this.membersService.resolveScope(churchId, user.role, scope === 'all');
+    return this.membersService.youthSummary(s);
+  }
+
+  /** Mark / unmark many existing members as youth at once. */
+  @Post('youth/bulk')
+  @Roles(...MEMBER_WRITE_ROLES)
+  async youthBulk(
+    @ChurchId() churchId: string,
+    @CurrentUser() user: { id: string; role: string },
+    @Body() dto: YouthBulkDto,
+  ) {
+    const s = await this.membersService.resolveScope(churchId, user.role, true);
+    return this.membersService.setYouthBulk(s, dto.memberIds, dto.isYouth, user.id);
   }
 
   @Get('count')
@@ -76,9 +102,10 @@ export class MembersController {
     @CurrentUser() user: { role: string },
     @Query('status') status?: string,
     @Query('scope') scope?: string,
+    @Query('youth') youth?: string,
   ) {
     const s = await this.membersService.resolveScope(churchId, user.role, scope === 'all');
-    return this.membersService.count(s, status);
+    return this.membersService.count(s, status, youth === 'true');
   }
 
   /**
